@@ -1,6 +1,6 @@
 /* Offline shell for inspections.stressfreepm.ca: a reload in a unit with weak signal still opens.
    Pages: network first, cache fallback. Static assets (hashed): cache first. */
-const CACHE = "sfpm-insp-v2";
+const CACHE = "sfpm-insp-v3";
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/", "/brand/logo.svg", "/brand/favicon.png"])).then(() => self.skipWaiting()));
 });
