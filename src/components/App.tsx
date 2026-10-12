@@ -755,7 +755,7 @@ function ItemRow({ it, room, compare, onPatch, onRemove, onAddPhotos, onRemovePh
   const noteField = (
     <div className="field">
       <label className="sr-only" htmlFor={`n-${it.id}`}>Note for {it.label}</label>
-      <input id={`n-${it.id}`} type="text" className="note-input" placeholder={flagged ? "Describe it: where, how big" : "Note"} value={it.comment} onChange={(e) => onPatch({ comment: e.target.value })} />
+      <textarea id={`n-${it.id}`} className="note-input" rows={it.comment.length > 34 ? 3 : 1} placeholder={flagged ? "Describe it: where, how big" : "Note"} value={it.comment} onChange={(e) => onPatch({ comment: e.target.value })} />
     </div>
   );
 
