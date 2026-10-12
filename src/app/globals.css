@@ -827,3 +827,4 @@ html { scroll-padding-top: calc(var(--header-h) + 16px); }
 }
 .chips-row { flex-wrap: wrap; overflow: visible; }
 .chips-row .chip { padding: 0 10px; gap: 6px; }
+@media (max-width: 1023px) { .page.app .big-choice { max-height: none; } .page.app .big-choices { gap: 12px; } }
