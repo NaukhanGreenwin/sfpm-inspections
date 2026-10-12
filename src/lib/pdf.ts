@@ -1,8 +1,10 @@
 /* Client-side PDF of a completed inspection (jsPDF, loaded only when needed).
+   v3: not used by the UI (there is no download/print/share). Kept for the future Email report
+   backend, option B in src/lib/email-report.ts.
    Letter portrait, white paper, SFPM colour logo, navy rules, text-first tables (conditions are
    written out, never colour-only), photo appendix with numbered captions, signatures, page footer. */
-import type { Item, Report, Room } from "./types";
-import { COMPANY, OFFICE_EMAIL, OFFICE_PHONE_DISPLAY, addressLine, condLabel, fmtDate, fmtDateTime, itemChange, typeLabel } from "./template";
+import type { Item, Report } from "./types";
+import { COMPANY, OFFICE_EMAIL, OFFICE_PHONE_DISPLAY, addressLine, condLabel, fmtDate, fmtDateTime, typeLabel } from "./template";
 import { getPhoto, blobToDataUrl } from "./store";
 
 const NAVY: [number, number, number] = [34, 37, 90];
@@ -83,7 +85,6 @@ export async function buildPdf(r: Report): Promise<Blob> {
     ["Tenant present", r.details.tenantPresent ? "Yes" : "No, inspected without the tenant present"],
   ];
   if (r.type === "out") {
-    det.push(["Compared with", r.baselineRef ? `Move-in report ${r.baselineRef.id} (${fmtDate(r.baselineRef.date)})` : "No move-in report was loaded"]);
     if (r.details.forwardingAddress.trim()) det.push(["Forwarding address", r.details.forwardingAddress]);
   }
   const colW = CW / 2 - 10;
@@ -112,23 +113,7 @@ export async function buildPdf(r: Report): Promise<Blob> {
   const sumText = `${r.rooms.length} areas and ${all.length} items inspected. Good: ${count("good")}. Fair: ${count("fair")}. Poor: ${count("poor")}. Not applicable: ${count("na")}.`;
   doc.text(lines(sumText, CW), M, y); y += 14;
   const flagged = std.flatMap((room) => room.items.filter((i) => i.cond === "fair" || i.cond === "poor").map((i) => ({ room, i })));
-  if (r.type === "out" && r.baselineRef) {
-    const worse = std.flatMap((room) => room.items.filter((i) => itemChange(i, "std") === "worse").map((i) => ({ room, i })));
-    const keys = r.rooms.filter((x) => x.kind === "keys").flatMap((room) => room.items.filter((i) => itemChange(i, "keys") === "worse").map((i) => ({ room, i })));
-    y += 6;
-    font("bold", 9.5, worse.length + keys.length ? ALERT : INK);
-    doc.text(worse.length + keys.length ? `Changed since move-in (${worse.length + keys.length})` : "No items recorded in worse condition than at move-in.", M, y);
-    y += 14;
-    for (const { room, i } of worse) {
-      const s = `${room.name} - ${i.label}: ${condLabel(i.before?.cond ?? "")} at move-in, ${condLabel(i.cond)} at move-out${i.comment ? `. ${i.comment}` : ""}${i.cost ? ` (est. $${i.cost})` : ""}`;
-      const ls = lines(s, CW - 14); ensure(ls.length * 12);
-      font("normal", 9.5, INK); doc.text("-", M, y); doc.text(ls, M + 12, y); y += ls.length * 12 + 2;
-    }
-    for (const { i } of keys) {
-      const s = `${i.label}: ${i.before?.count || 0} issued at move-in, ${i.count || 0} returned`;
-      ensure(12); font("normal", 9.5, INK); doc.text("-", M, y); doc.text(t(s), M + 12, y); y += 14;
-    }
-  } else if (flagged.length) {
+  if (flagged.length) {
     y += 6; font("bold", 9.5, INK); doc.text(`Items noted as Fair or Poor (${flagged.length})`, M, y); y += 14;
     for (const { room, i } of flagged) {
       const s = `${room.name} - ${i.label}: ${condLabel(i.cond)}${i.issues.length ? ` (${i.issues.join(", ").toLowerCase()})` : ""}${i.comment ? `. ${i.comment}` : ""}`;
@@ -146,15 +131,12 @@ export async function buildPdf(r: Report): Promise<Blob> {
     for (const it of room.items) {
       const parts: string[] = [];
       if (it.photoIds.length) parts.push(addRefs(it.photoIds, `${room.name} - ${it.label}${it.cond ? ` - ${condLabel(it.cond)}` : ""}${it.comment ? `: ${it.comment}` : ""}`));
-      // on a move-out, the move-in photos of the same item go in too, so both states sit in one document
-      if (r.type === "out" && it.before?.photoIds.length)
-        parts.push(`move-in ${addRefs(it.before.photoIds, `${room.name} - ${it.label} - at move-in${r.baselineRef ? ` (${fmtDate(r.baselineRef.date)})` : ""}, ${condLabel(it.before.cond)}${it.before.comment ? `: ${it.before.comment}` : ""}`)}`);
       if (parts.length) refs.set(it.id, parts.join(", "));
     }
   }
 
   /* ---------- rooms ---------- */
-  const compare = r.type === "out" && !!r.baselineRef;
+  const out = r.type === "out";
   type Col = { h: string; w: number };
   const tableHead = (cols: Col[]) => {
     ensure(40);
@@ -187,45 +169,21 @@ export async function buildPdf(r: Report): Promise<Blob> {
     ensure(70);
     roomName = room.name;
     font("normal", 12.5, INK, "times"); doc.text(t(room.name), M, y);
-    if (room.addedAtMoveOut) { font("italic", 8.5, MUTED); doc.text("Not on the move-in report", W - M, y, { align: "right" }); }
     y += 14;
     if (room.kind === "std") {
-      const cols: Col[] = compare
-        ? [{ h: "Item", w: 140 }, { h: "Move-in", w: 64 }, { h: "Move-out", w: 64 }, { h: "Notes", w: CW - 140 - 128 - 102 }, { h: "Change", w: 50 }, { h: "Photos", w: 52 }]
-        : [{ h: "Item", w: 160 }, { h: "Condition", w: 70 }, { h: "Notes", w: CW - 160 - 70 - 60 }, { h: "Photos", w: 60 }];
+      const cols: Col[] = [{ h: "Item", w: 160 }, { h: "Condition", w: 70 }, { h: "Notes", w: CW - 160 - 70 - 60 }, { h: "Photos", w: 60 }];
       tableHead(cols);
       for (const it of room.items) {
-        if (compare) {
-          const ch = itemChange(it, "std");
-          tableRow(cols, [
-            { s: it.label },
-            { s: it.before ? condLabel(it.before.cond) : "Not recorded", color: MUTED },
-            condCell(it),
-            { s: [noteOf(it), it.cost ? `Est. cost $${it.cost}` : ""].filter(Boolean).join(". ") || (it.before?.comment ? `Move-in note: ${it.before.comment}` : "") },
-            { s: ch === "worse" ? "Worse" : ch === "better" ? "Better" : ch === "same" ? "Same" : "-", bold: ch === "worse", color: ch === "worse" ? ALERT : MUTED },
-            { s: refs.get(it.id) ?? "" },
-          ], cols);
-        } else {
-          tableRow(cols, [{ s: it.label }, condCell(it), { s: noteOf(it) }, { s: refs.get(it.id) ?? "" }], cols);
-        }
+        tableRow(cols, [{ s: it.label }, condCell(it), { s: [noteOf(it), out && it.cost ? `Est. cost $${it.cost}` : ""].filter(Boolean).join(". ") }, { s: refs.get(it.id) ?? "" }], cols);
       }
     } else if (room.kind === "keys") {
-      const cols: Col[] = compare
-        ? [{ h: "Key / remote", w: 200 }, { h: "Issued at move-in", w: 110 }, { h: "Returned", w: 80 }, { h: "Notes", w: CW - 390 }]
-        : [{ h: "Key / remote", w: 220 }, { h: "Number issued", w: 100 }, { h: "Notes", w: CW - 320 }];
+      const cols: Col[] = [{ h: "Key / remote", w: 220 }, { h: out ? "Number returned" : "Number issued", w: 100 }, { h: "Notes", w: CW - 320 }];
       tableHead(cols);
-      for (const it of room.items) {
-        const short = compare && itemChange(it, "keys") === "worse";
-        tableRow(cols, compare
-          ? [{ s: it.label }, { s: it.before?.count || "0", color: MUTED }, { s: it.count || "0", bold: short, color: short ? ALERT : INK }, { s: [short ? "Fewer returned than issued" : "", it.comment].filter(Boolean).join(". ") }]
-          : [{ s: it.label }, { s: it.count || "0" }, { s: it.comment }], cols);
-      }
+      for (const it of room.items) tableRow(cols, [{ s: it.label }, { s: it.count || "0" }, { s: it.comment }], cols);
     } else {
-      const cols: Col[] = [{ h: "Meter", w: 120 }, ...(compare ? [{ h: "Move-in reading", w: 110 }] : []), { h: "Reading", w: 110 }, { h: "Notes", w: CW - 230 - (compare ? 110 : 0) - 50 }, { h: "Photos", w: 50 }];
+      const cols: Col[] = [{ h: "Meter", w: 120 }, { h: "Reading", w: 110 }, { h: "Notes", w: CW - 230 - 50 }, { h: "Photos", w: 50 }];
       tableHead(cols);
-      for (const it of room.items) {
-        tableRow(cols, [{ s: it.label }, ...(compare ? [{ s: it.before?.reading || "-", color: MUTED }] : []), { s: it.reading || "-" }, { s: it.comment }, { s: refs.get(it.id) ?? "" }], cols);
-      }
+      for (const it of room.items) tableRow(cols, [{ s: it.label }, { s: it.reading || "-" }, { s: it.comment }, { s: refs.get(it.id) ?? "" }], cols);
     }
     if (room.notes.trim() || refs.get(room.id)) {
       const s = [room.notes.trim() && `Notes: ${room.notes.trim()}`, refs.get(room.id) && `Overview photos: ${refs.get(room.id)}`].filter(Boolean).join("   ");
@@ -325,6 +283,4 @@ export const pdfFileName = (r: Report) => {
   const a = `${r.details.unit ? `Unit ${r.details.unit} ` : ""}${r.details.address}`.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, " ").slice(0, 60);
   return `${typeLabel(r.type)} inspection - ${a || "unit"} - ${r.details.date}.pdf`;
 };
-export const jsonFileName = (r: Report) => pdfFileName(r).replace(/\.pdf$/, ".json");
 
-export function roomsWithIssues(rooms: Room[]) { return rooms.filter((r) => r.items.some((i) => i.cond === "poor" || i.cond === "fair")); }

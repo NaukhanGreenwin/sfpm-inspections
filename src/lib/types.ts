@@ -2,16 +2,6 @@ export type InspectionType = "in" | "out";
 export type Condition = "good" | "fair" | "poor" | "na" | "";
 export type RoomKind = "std" | "keys" | "meters";
 
-/** What the move-in report recorded for an item (copied into a move-out report). */
-export interface Baseline {
-  cond: Condition;
-  issues: string[];
-  comment: string;
-  count?: string; // keys issued
-  reading?: string; // meters
-  photoIds: string[]; // thumbnails available on this device
-}
-
 export interface Item {
   id: string;
   label: string;
@@ -22,9 +12,8 @@ export interface Item {
   /** keys: number issued (move-in) or returned (move-out); meters: reading */
   count?: string;
   reading?: string;
-  /** move-out only, optional */
+  /** move-out only, optional estimate for the office */
   cost?: string;
-  before?: Baseline | null;
   custom?: boolean;
 }
 
@@ -37,8 +26,6 @@ export interface Room {
   items: Item[];
   notes: string;
   photoIds: string[];
-  /** set when the room was missing at move-in (added later) */
-  addedAtMoveOut?: boolean;
 }
 
 export interface Signature {
@@ -69,6 +56,13 @@ export interface MoveOutNotes {
   charges: string;
 }
 
+export interface EmailState {
+  tenant: string; // comma-separated
+  office: string; // landlord / office copy
+  /** last time the inspector pressed Email report (ISO); sending is not wired yet */
+  triedAt?: string;
+}
+
 export interface Report {
   v: 1;
   id: string; // MI-261012-AB12 / MO-...
@@ -79,10 +73,10 @@ export interface Report {
   details: Details;
   rooms: Room[];
   moveOut: MoveOutNotes;
-  /** move-out: the move-in report it was compared against */
-  baselineRef: { id: string; date: string; inspector: string } | null;
   tenantSigs: TenantSignature[];
   landlordSig: Signature | null;
+  /** Email report step (the only way a finished report leaves the app) */
+  email?: EmailState;
   /** UI position so a refresh returns to the same screen */
   screen: string;
 }
@@ -95,15 +89,4 @@ export interface PhotoRecord {
   w: number;
   h: number;
   takenAt: string;
-}
-
-/** The small portable file a move-in exports for the move-out. */
-export interface ReportFile {
-  kind: "sfpm-inspection";
-  v: 1;
-  report: Report;
-  /** photo id -> 960px JPEG data URL (enough for the move-out screen and PDF) */
-  thumbs: Record<string, string>;
-  /** photo id -> ISO time the photo was added */
-  taken?: Record<string, string>;
 }

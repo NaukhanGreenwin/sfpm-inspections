@@ -2,7 +2,7 @@ import type { PhotoRecord } from "./types";
 import { uid } from "./template";
 
 /* Photos are compressed on the phone before they are stored: max 1600px long edge at JPEG 0.72
-   (typically 150-350 KB) plus a 320px thumbnail for the screens, the move-in file and the PDF grid. */
+   (typically 150-350 KB) plus a 320px thumbnail for the screens and the PDF grid. */
 const FULL = 1600, THUMB = 320;
 
 async function decode(file: Blob): Promise<ImageBitmap | HTMLImageElement> {

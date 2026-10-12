@@ -8,7 +8,7 @@ const sans = Instrument_Sans({ subsets: ["latin"], variable: "--font-sans", disp
 
 const isDev = process.env.NODE_ENV !== "production";
 
-// TODO(wire-submit): add the API origin to connect-src when submit-report.ts is wired.
+// TODO(wire-email): add the API origin to connect-src when src/lib/email-report.ts is wired.
 const CSP = [
   "default-src 'self'",
   `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,

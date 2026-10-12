@@ -17,8 +17,6 @@ export const CONDITIONS: { value: Exclude<Condition, "">; label: string; short: 
   { value: "na", label: "N/A", short: "N/A" },
 ];
 export const condLabel = (c: Condition) => CONDITIONS.find((x) => x.value === c)?.label ?? "Not marked";
-/** good 3, fair 2, poor 1; used to flag "worse than move-in" */
-export const condRank = (c: Condition) => (c === "good" ? 3 : c === "fair" ? 2 : c === "poor" ? 1 : 0);
 
 export const ISSUES = ["Dirty", "Scratched", "Stained", "Damaged", "Broken", "Missing", "Not working"];
 
@@ -47,7 +45,7 @@ let seq = 0;
 export const uid = (p = "") => `${p}${Date.now().toString(36)}${(seq++).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
 export function makeItem(label: string, custom = false): Item {
-  return { id: uid("i"), label, cond: "", issues: [], comment: "", photoIds: [], custom, before: null };
+  return { id: uid("i"), label, cond: "", issues: [], comment: "", photoIds: [], custom };
 }
 
 export function makeRoom(key: string, n?: number): Room {
@@ -114,7 +112,7 @@ export function newReport(type: InspectionType): Report {
   return {
     v: 1, id: makeReportId(type), type, status: "draft", createdAt: new Date().toISOString(), completedAt: "",
     details: emptyDetails(), rooms: defaultRooms(), moveOut: { comparison: "", damages: "", charges: "" },
-    baselineRef: null, tenantSigs: [], landlordSig: null, screen: "details",
+    tenantSigs: [], landlordSig: null, email: { tenant: "", office: OFFICE_EMAIL }, screen: "details",
   };
 }
 
@@ -131,21 +129,6 @@ export const fmtDateTime = (iso: string) => {
 };
 
 export const addressLine = (d: Details) => [d.unit && `Unit ${d.unit}`, d.address, d.city].filter((x) => x && x.trim()).join(", ");
-
-/** Change vs move-in for one item. */
-export type Change = "worse" | "better" | "same" | "new" | "none";
-export function itemChange(it: Item, kind: RoomKind): Change {
-  if (!it.before) return "none";
-  if (kind === "keys") {
-    const a = parseInt(it.before.count || "0", 10) || 0, b = parseInt(it.count || "0", 10) || 0;
-    if (!it.count) return "none";
-    return b < a ? "worse" : b > a ? "better" : "same";
-  }
-  if (kind === "meters") return "none";
-  if (!it.cond || it.cond === "na" || !it.before.cond || it.before.cond === "na") return "none";
-  const d = condRank(it.cond) - condRank(it.before.cond);
-  return d < 0 ? "worse" : d > 0 ? "better" : "same";
-}
 
 /** Items that still need a mark on a room screen. */
 export function unmarked(room: Room): number {
