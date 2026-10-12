@@ -41,6 +41,12 @@ export const IconClose = ({ size, ...p }: P) => (
 export const IconPlay = ({ size, ...p }: P) => (
   <svg {...base(size)} {...p}><path d="M8.5 6.5v11l9-5.5-9-5.5Z" /></svg>
 );
+export const IconList = ({ size, ...p }: P) => (
+  <svg {...base(size)} {...p}><path d="M9 6.5h11M9 12h11M9 17.5h11" /><circle cx="4.8" cy="6.5" r="0.9" /><circle cx="4.8" cy="12" r="0.9" /><circle cx="4.8" cy="17.5" r="0.9" /></svg>
+);
+export const IconNote = ({ size, ...p }: P) => (
+  <svg {...base(size)} {...p}><path d="M5 4.5h14v10.5l-4.5 4.5H5Z" /><path d="M14.5 19.5V15H19" /><path d="M8.5 9h7M8.5 12h4.5" /></svg>
+);
 export const IconShield = ({ size, ...p }: P) => (
   <svg {...base(size)} {...p}><path d="M12 3.5 5 6v5.5c0 4.2 2.9 7.6 7 9 4.1-1.4 7-4.8 7-9V6l-7-2.5Z" /><polyline points="9,12.2 11.2,14.3 15.2,9.8" /></svg>
 );

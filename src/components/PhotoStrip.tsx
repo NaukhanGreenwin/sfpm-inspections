@@ -20,12 +20,15 @@ interface Props {
   label: string;
   onAdd: (files: File[]) => Promise<void>;
   onRemove: (id: string) => void;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, remove?: () => void) => void;
   compact?: boolean;
+  /** One row: small thumbs + a square camera button (room checklist rows). */
+  inline?: boolean;
+  buttonLabel?: string;
 }
 
 /** One button: the phone offers Take Photo / Photo Library itself. */
-export default function PhotoStrip({ ids, label, onAdd, onRemove, onOpen, compact }: Props) {
+export default function PhotoStrip({ ids, label, onAdd, onRemove, onOpen, compact, inline, buttonLabel }: Props) {
   const ref = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(0);
   const pick = async (list: FileList | null) => {
@@ -34,6 +37,23 @@ export default function PhotoStrip({ ids, label, onAdd, onRemove, onOpen, compac
     setBusy(files.length);
     try { await onAdd(files); } finally { setBusy(0); if (ref.current) ref.current.value = ""; }
   };
+  const input = <input ref={ref} type="file" accept="image/*" multiple hidden onChange={(e) => void pick(e.target.files)} />;
+  if (inline) {
+    return (
+      <div className="photos-inline">
+        {ids.map((id, i) => (
+          <span key={id} className="ph ph-xs">
+            <Thumb id={id} alt={`${label}, photo ${i + 1}`} onOpen={(pid) => onOpen(pid, () => onRemove(pid))} />
+          </span>
+        ))}
+        {busy > 0 && <span className="ph ph-xs ph-busy" aria-live="polite">…</span>}
+        <button type="button" className={`cam-btn${buttonLabel ? " cam-btn-wide" : ""}`} onClick={() => ref.current?.click()} disabled={busy > 0} aria-label={buttonLabel ?? `Add a photo of ${label}`}>
+          <IconCamera size={20} />{buttonLabel && <span>{buttonLabel}{ids.length ? ` (${ids.length})` : ""}</span>}
+        </button>
+        {input}
+      </div>
+    );
+  }
   return (
     <div className={`photos${compact ? " photos-compact" : ""}`}>
       {(ids.length > 0 || busy > 0) && (
@@ -50,7 +70,7 @@ export default function PhotoStrip({ ids, label, onAdd, onRemove, onOpen, compac
       <button type="button" className={`btn btn-quiet ${compact ? "btn-sm" : "btn-block"}`} onClick={() => ref.current?.click()} disabled={busy > 0}>
         <IconCamera size={20} /><span>{ids.length ? "Add another photo" : "Add photo"}</span>
       </button>
-      <input ref={ref} type="file" accept="image/*" multiple hidden onChange={(e) => void pick(e.target.files)} />
+      {input}
     </div>
   );
 }

@@ -15,13 +15,16 @@ import { applyBaseline, detachBaseline } from "@/lib/compare";
 import { submitInspectionReport } from "@/lib/submit-report";
 import PhotoStrip, { Thumb } from "./PhotoStrip";
 import SignaturePad from "./SignaturePad";
-import { IconArrowLeft, IconArrowRight, IconCheck, IconClose, IconPhone, IconShield } from "./icons";
+import { IconArrowLeft, IconArrowRight, IconCamera, IconCheck, IconClose, IconList, IconNote, IconPhone, IconShield } from "./icons";
 
 /* ------------------------------------------------------------------ */
 /* steps                                                               */
 /* ------------------------------------------------------------------ */
 interface Step { key: string; label: string }
+const splitTenants = (s: string) => s.split(/\s*(?:,|&|\band\b|\n|;)\s*/i).map((x) => x.trim()).filter(Boolean).slice(0, 6);
+
 function stepsFor(r: Report): Step[] {
+  const names = splitTenants(r.details.tenants);
   return [
     ...(r.type === "out" ? [{ key: "baseline", label: "Move-in report" }] : []),
     { key: "details", label: "Inspection details" },
@@ -29,17 +32,27 @@ function stepsFor(r: Report): Step[] {
     ...r.rooms.map((x) => ({ key: `room:${x.id}`, label: x.name })),
     ...(r.type === "out" ? [{ key: "notes", label: "Move-out notes" }] : []),
     { key: "review", label: "Review" },
-    { key: "sign", label: "Signatures" },
+    ...(r.details.tenantPresent ? names.map((n, i) => ({ key: `sign:t${i}`, label: `Signature: ${n}` })) : []),
+    { key: "sign:ll", label: "Signature: landlord / agent" },
   ];
 }
-const splitTenants = (s: string) => s.split(/\s*(?:,|&|\band\b|\n|;)\s*/i).map((x) => x.trim()).filter(Boolean).slice(0, 6);
+/** One signature block per tenant name entered on the details screen, plus the landlord/agent. */
+function syncSigs(r: Report): Report {
+  const names = splitTenants(r.details.tenants);
+  if (r.tenantSigs.length === names.length && r.landlordSig) return r;
+  return {
+    ...r,
+    tenantSigs: names.map((n, i) => r.tenantSigs[i] ?? { name: n, dataUrl: "", at: "", agree: "", reason: "" }),
+    landlordSig: r.landlordSig ?? { name: r.details.inspector, dataUrl: "", at: "" },
+  };
+}
 
 function validateDetails(r: Report): Record<string, string> {
   const d = r.details, e: Record<string, string> = {};
   if (!d.address.trim()) e.address = "Enter the property address.";
   if (!d.tenants.trim()) e.tenants = "Enter the tenant name(s).";
-  if (!d.inspector.trim()) e.inspector = "Enter who is doing the inspection.";
-  if (!d.date) e.date = "Choose the inspection date.";
+  if (!d.inspector.trim()) e.inspector = "Enter who is inspecting.";
+  if (!d.date) e.date = "Choose the date.";
   return e;
 }
 function validateSign(r: Report): Record<string, string> {
@@ -48,15 +61,19 @@ function validateSign(r: Report): Record<string, string> {
     r.tenantSigs.forEach((s, i) => {
       if (!s.name.trim()) e[`tn${i}`] = "Enter the tenant's name.";
       if (!s.agree) e[`ta${i}`] = "Choose one.";
-      if (s.agree !== "declined" && !s.dataUrl) e[`ts${i}`] = "Tenant signature needed, or choose Declined to sign.";
+      if (s.agree !== "declined" && !s.dataUrl) e[`ts${i}`] = "Signature needed, or choose Declined.";
     });
   }
   if (!r.landlordSig?.name.trim()) e.ln = "Enter the landlord or agent's name.";
   if (!r.landlordSig?.dataUrl) e.ls = "Landlord or agent signature needed.";
   return e;
 }
+/** Error keys that belong to one signature screen. */
+const signKeyOf = (errKey: string) => (/^t[nas](\d+)$/.test(errKey) ? `sign:t${errKey.replace(/^t[nas]/, "")}` : "sign:ll");
+const errorsFor = (all: Record<string, string>, screen: string) => Object.fromEntries(Object.entries(all).filter(([k]) => signKeyOf(k) === screen));
 
 type Dialog = { title: string; body: ReactNode; actions: { label: string; kind?: "primary" | "quiet" | "alert"; run: () => void }[] } | null;
+type Opener = (id: string, remove?: () => void) => void;
 
 /* ------------------------------------------------------------------ */
 export default function App() {
@@ -66,17 +83,20 @@ export default function App() {
   const [saved, setSaved] = useState<Report[] | null>(null); // "Saved on this device" screen when not null
   const [viewing, setViewing] = useState<Report | null>(null); // a saved report opened read-only
   const [dialog, setDialog] = useState<Dialog>(null);
-  const [lightbox, setLightbox] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<{ id: string; remove?: () => void } | null>(null);
   const [sheet, setSheet] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saveState, setSaveState] = useState<"saved" | "error" | "">("");
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const pageRef = useRef<HTMLDivElement>(null);
 
   /* ---------- boot: restore draft, service worker ---------- */
   useEffect(() => {
-    const d = loadDraft();
-    if (d) { setReport(d); setHome(false); }
+    let d = loadDraft();
+    if (d) {
+      // drafts saved by v1 used one "sign" screen; send them to the first signature screen
+      if (d.screen === "sign") { d = syncSigs(d); d = { ...d, screen: stepsFor(d).find((s) => s.key.startsWith("sign:"))!.key }; }
+      setReport(d); setHome(false);
+    }
     setReady(true);
     void requestPersistence();
     if ("serviceWorker" in navigator && location.hostname !== "localhost") navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -102,23 +122,27 @@ export default function App() {
     return () => { window.removeEventListener("pagehide", h); document.removeEventListener("visibilitychange", h); };
   }, [flush]);
 
+  const update = useCallback((fn: (r: Report) => Report) => setReport((r) => (r ? fn(r) : r)), []);
+  const screen = report?.screen ?? "";
+
+  // signature screens need one block per tenant name (names can change on the details screen)
+  useEffect(() => {
+    if (report && report.status === "draft" && screen.startsWith("sign:") && syncSigs(report) !== report) update(syncSigs);
+  }, [report, screen, update]);
+
   // once errors are on screen, re-check on every edit so fixed fields clear straight away
   useEffect(() => {
     if (!report || !Object.keys(errors).length) return;
-    const e = report.screen === "details" ? validateDetails(report) : report.screen === "sign" ? validateSign(report) : null;
+    const e = report.screen === "details" ? validateDetails(report) : report.screen.startsWith("sign:") ? errorsFor(validateSign(report), report.screen) : null;
     if (e && JSON.stringify(e) !== JSON.stringify(errors)) setErrors(e);
   }, [report, errors]);
 
-  const update = useCallback((fn: (r: Report) => Report) => setReport((r) => (r ? fn(r) : r)), []);
-  const screen = report?.screen ?? "";
   const steps = useMemo(() => (report ? stepsFor(report) : []), [report]);
   const stepIdx = Math.max(0, steps.findIndex((s) => s.key === screen));
 
-  const scrollTop = () => { pageRef.current?.scrollTo({ top: 0 }); window.scrollTo({ top: 0 }); };
   const go = (key: string) => {
     setErrors({}); setSheet(false);
-    update((r) => ({ ...r, screen: key }));
-    scrollTop();
+    update((r) => ({ ...(key.startsWith("sign:") ? syncSigs(r) : r), screen: key }));
     setTimeout(() => headingRef.current?.focus({ preventScroll: true }), 30);
   };
 
@@ -128,7 +152,7 @@ export default function App() {
       if (report && report.status === "draft") void deletePhotosFor(report.id);
       const r = newReport(type);
       if (type === "out") r.screen = "baseline";
-      setReport(r); saveDraft(r); setHome(false); setSaved(null); setViewing(null); setDialog(null); scrollTop();
+      setReport(r); saveDraft(r); setHome(false); setSaved(null); setViewing(null); setDialog(null);
     };
     if (report && report.status === "draft") {
       setDialog({
@@ -141,9 +165,9 @@ export default function App() {
       });
     } else start();
   };
-  const exitToHome = () => { flush(); setHome(true); setSaved(null); setViewing(null); setSheet(false); scrollTop(); };
+  const exitToHome = () => { flush(); setHome(true); setSaved(null); setViewing(null); setSheet(false); };
   const closeCompleted = () => { saveDraft(null); setReport(null); exitToHome(); };
-  const openSaved = async () => { setSaved(await listReports().catch(() => [])); setHome(true); setViewing(null); scrollTop(); };
+  const openSaved = async () => { setSaved(await listReports().catch(() => [])); setHome(true); setViewing(null); };
 
   /* ---------- photo plumbing ---------- */
   const addPhotos = useCallback(async (files: File[], attach: (ids: string[]) => void) => {
@@ -156,13 +180,16 @@ export default function App() {
     if (ids.length) attach(ids);
   }, [report]);
   const removePhoto = (id: string, detach: () => void) => { detach(); void deletePhoto(id); };
+  const openPhoto: Opener = (id, remove) => setLightbox({ id, remove });
 
   /* ---------- room/item updates ---------- */
   const patchRoom = (roomId: string, fn: (room: Room) => Room) => update((r) => ({ ...r, rooms: r.rooms.map((x) => (x.id === roomId ? fn(x) : x)) }));
   const patchItem = (roomId: string, itemId: string, patch: Partial<Item>) =>
     patchRoom(roomId, (room) => ({ ...room, items: room.items.map((i) => (i.id === itemId ? { ...i, ...patch } : i)) }));
+  const markAllGood = (roomId: string) => patchRoom(roomId, (room) => ({ ...room, items: room.items.map((i) => (i.cond ? i : { ...i, cond: "good" as Condition })) }));
 
   /* ---------- navigation with validation ---------- */
+  const isLast = stepIdx === steps.length - 1;
   const next = () => {
     if (!report) return;
     const r = report;
@@ -187,35 +214,47 @@ export default function App() {
         return;
       }
     }
-    if (screen === "sign") return complete();
+    if (screen.startsWith("sign:")) {
+      const e = errorsFor(validateSign(r), screen);
+      if (Object.keys(e).length) { setErrors(e); return; }
+      if (isLast) return complete();
+    }
     if (stepIdx < steps.length - 1) go(steps[stepIdx + 1].key);
   };
   const back = () => { if (stepIdx > 0) go(steps[stepIdx - 1].key); else exitToHome(); };
-  const markAllGood = (roomId: string) => patchRoom(roomId, (room) => ({ ...room, items: room.items.map((i) => (i.cond ? i : { ...i, cond: "good" as Condition })) }));
 
   /* ---------- complete ---------- */
   const complete = () => {
     if (!report) return;
     const r = report, e = validateSign(r);
-    setErrors(e);
-    if (Object.keys(e).length) { setTimeout(() => document.querySelector<HTMLElement>(".has-error")?.scrollIntoView({ block: "center" }), 20); return; }
+    if (Object.keys(e).length) {
+      const first = signKeyOf(Object.keys(e)[0]);
+      go(first); setTimeout(() => setErrors(errorsFor(e, first)), 40);
+      return;
+    }
     const done: Report = { ...r, status: "complete", completedAt: new Date().toISOString(), screen: "done" };
     setReport(done); saveDraft(done);
     void putReport(done);
-    scrollTop();
   };
 
-  if (!ready) return <div className="page" ref={pageRef}><Masthead onHome={() => {}} /></div>;
+  if (!ready) return <div className="page app"><Masthead onHome={() => {}} /></div>;
 
   /* ---------- which view ---------- */
   const doneView = viewing ?? (report && report.status === "complete" && !home ? report : null);
   const inFlow = !!report && !home && report.status === "draft";
   const curStep = steps[stepIdx];
+  const curRoom = screen.startsWith("room:") ? report?.rooms.find((x) => `room:${x.id}` === screen) ?? null : null;
+  const roomPos = curRoom && report ? report.rooms.indexOf(curRoom) + 1 : 0;
+  const signSteps = steps.filter((s) => s.key.startsWith("sign:"));
+  const signPos = signSteps.findIndex((s) => s.key === screen) + 1;
+  const where = curRoom && report ? `Room ${roomPos} of ${report.rooms.length}` : signPos ? `Signature ${signPos} of ${signSteps.length}` : `Step ${stepIdx + 1} of ${steps.length}`;
+  const nextLabel = isLast ? "Finish" : screen === "review" ? "Sign" : steps[stepIdx + 1]?.key === "review" ? "Review" : "Next";
 
   return (
-    <div className="page" ref={pageRef}>
+    <div className={`page app${inFlow ? " in-flow" : ""}`}>
       <a className="skip" href="#main">Skip to the checklist</a>
-      <Masthead onHome={exitToHome} />
+      <Masthead onHome={exitToHome} onSteps={inFlow ? () => setSheet(true) : undefined} />
+      {inFlow && <div className="progress-bar progress-top" aria-hidden="true"><span style={{ width: `${((stepIdx + 1) / steps.length) * 100}%` }} /></div>}
 
       <div className="layout">
         <aside className="rail" aria-label="Inspection outline">
@@ -270,48 +309,45 @@ export default function App() {
               }) : undefined}
             />
           ) : saved ? (
-            <SavedList list={saved} onOpen={(r) => { setViewing(r); setSaved(null); scrollTop(); }} onBack={() => setSaved(null)}
+            <SavedList list={saved} onOpen={(r) => { setViewing(r); setSaved(null); }} onBack={() => setSaved(null)}
               onImport={async (text) => { try { await importReportFile(text); setSaved(await listReports()); } catch (err) { setDialog({ title: "File not loaded", body: <p>{(err as Error).message}</p>, actions: [{ label: "OK", kind: "primary", run: () => setDialog(null) }] }); } }} />
           ) : !inFlow || !report ? (
             <Landing draft={report && report.status === "draft" ? report : null} onStart={begin} onResume={() => setHome(false)} onSaved={openSaved} />
           ) : (
-            <form className="flow" noValidate onSubmit={(e) => { e.preventDefault(); next(); }}>
-              <div className="progress">
-                <div className="progress-meta">
-                  <span className="tnum">Step {stepIdx + 1} of {steps.length}</span>
-                  <button type="button" className="link progress-jump" onClick={() => setSheet(true)}>All steps</button>
+            <form className="screen flow" noValidate onSubmit={(e) => { e.preventDefault(); next(); }}>
+              <header className={`screen-head${curRoom ? " is-room" : ""}`}>
+                <div className="screen-head-text">
+                  <p className="screen-eyebrow tnum">{typeLabel(report.type)}{addressLine(report.details) ? ` · ${addressLine(report.details)}` : ""}</p>
+                  <h2 id="step-title" ref={headingRef} tabIndex={-1} className="screen-title">{titleFor(report, curStep)}</h2>
                 </div>
-                <div className="progress-bar"><span style={{ width: `${((stepIdx + 1) / steps.length) * 100}%` }} /></div>
-              </div>
+                {curRoom && curRoom.kind === "std" && <MarkAll room={curRoom} onMark={() => markAllGood(curRoom.id)} />}
+              </header>
 
-              <section key={screen} className="step" aria-labelledby="step-title">
-                <p className="step-num tnum" aria-hidden="true">{typeLabel(report.type)} · {String(stepIdx + 1).padStart(2, "0")}</p>
-                <h2 id="step-title" ref={headingRef} tabIndex={-1} className="step-title">{titleFor(report, curStep)}</h2>
-                <div className="step-body">
-                  {screen === "baseline" && <BaselineStep r={report} update={update} setDialog={setDialog} />}
-                  {screen === "details" && <DetailsStep r={report} update={update} errors={errors} />}
-                  {screen === "layout" && <LayoutStep r={report} update={update} setDialog={setDialog} />}
-                  {screen.startsWith("room:") && (() => {
-                    const room = report.rooms.find((x) => `room:${x.id}` === screen);
-                    if (!room) return <p className="lede-sm">This room was removed. <button type="button" className="link" onClick={() => go("layout")}>Back to rooms</button></p>;
-                    return <RoomStep r={report} room={room} patchRoom={patchRoom} patchItem={patchItem} markAllGood={markAllGood}
-                      addPhotos={addPhotos} removePhoto={removePhoto} onOpen={setLightbox} />;
-                  })()}
-                  {screen === "notes" && <NotesStep r={report} update={update} />}
-                  {screen === "review" && <ReviewStep r={report} go={go} />}
-                  {screen === "sign" && <SignStep r={report} update={update} errors={errors} />}
-                </div>
+              <section key={screen} className={`screen-body step${curRoom ? " is-split" : ""}`} aria-labelledby="step-title">
+                {screen === "baseline" && <BaselineStep r={report} update={update} setDialog={setDialog} />}
+                {screen === "details" && <DetailsStep r={report} update={update} errors={errors} />}
+                {screen === "layout" && <LayoutStep r={report} update={update} setDialog={setDialog} />}
+                {screen.startsWith("room:") && (curRoom
+                  ? <RoomStep r={report} room={curRoom} patchRoom={patchRoom} patchItem={patchItem} addPhotos={addPhotos} removePhoto={removePhoto} onOpen={openPhoto} />
+                  : <p className="lede-sm">This room was removed. <button type="button" className="link" onClick={() => go("layout")}>Back to rooms</button></p>)}
+                {screen === "notes" && <NotesStep r={report} update={update} />}
+                {screen === "review" && <ReviewStep r={report} go={go} />}
+                {screen.startsWith("sign:") && <SignStep key={screen} r={report} screen={screen} update={update} errors={errors}
+                  onNotPresent={() => { update((cur) => ({ ...cur, details: { ...cur.details, tenantPresent: false } })); go("sign:ll"); }} />}
+                {!steps.some((s) => s.key === screen) && <p className="lede-sm">This step is no longer in the report. <button type="button" className="link" onClick={() => go("review")}>Go to the review</button></p>}
               </section>
 
-              <div className="actions">
-                <div className="actions-inner">
-                  <button type="button" className="btn btn-ghost" onClick={back}><IconArrowLeft size={20} /><span>Back</span></button>
-                  <button type="submit" className="btn btn-primary btn-next">
-                    <span>{screen === "sign" ? "Complete inspection" : screen === "review" ? "Continue to signatures" : "Continue"}</span>
-                    {screen !== "sign" && <IconArrowRight size={20} />}
+              <div className="bar">
+                <div className="bar-inner">
+                  <button type="button" className="btn btn-ghost bar-back" onClick={back}><IconArrowLeft size={20} /><span>Back</span></button>
+                  <button type="button" className="bar-where" onClick={() => setSheet(true)} aria-label={`${where}. Show all steps`}>
+                    <span className="bar-where-main tnum">{where}</span>
+                    <span className={`bar-where-sub${saveState === "error" ? " is-alert" : ""}`} aria-live="polite">{saveState === "error" ? "Not saved: storage full" : "Saved on this phone"}</span>
+                  </button>
+                  <button type="submit" className="btn btn-primary bar-next">
+                    <span>{nextLabel}</span>{!isLast && <IconArrowRight size={20} />}
                   </button>
                 </div>
-                <p className="autosave" aria-live="polite">{saveState === "error" ? "Not saved: this device's storage is full" : "Saved on this device"}</p>
               </div>
             </form>
           )}
@@ -348,7 +384,8 @@ export default function App() {
         </div>
       )}
 
-      {lightbox && <Lightbox id={lightbox} onClose={() => setLightbox(null)} />}
+      {lightbox && <Lightbox id={lightbox.id} onClose={() => setLightbox(null)}
+        onRemove={lightbox.remove ? () => { lightbox.remove!(); setLightbox(null); } : undefined} />}
       {dialog && (
         <div className="sheet-wrap is-center" role="alertdialog" aria-modal="true" aria-labelledby="dlg-title">
           <div className="dialog">
@@ -366,19 +403,20 @@ export default function App() {
 
 function titleFor(r: Report, s: Step | undefined): string {
   if (!s) return "";
-  if (s.key === "baseline") return "Start from the move-in report";
+  if (s.key === "baseline") return "Load the move-in report";
   if (s.key === "details") return "Inspection details";
   if (s.key === "layout") return "Rooms in this unit";
   if (s.key === "notes") return "Move-out notes";
-  if (s.key === "review") return "Review the report";
-  if (s.key === "sign") return "Signatures";
+  if (s.key === "review") return "Review";
+  if (s.key === "sign:ll") return "Landlord / agent signs";
+  if (s.key.startsWith("sign:t")) { const i = Number(s.key.slice(6)); return r.tenantSigs.length > 1 ? `Tenant ${i + 1} signs` : "Tenant signs"; }
   return s.label;
 }
 
 /* ------------------------------------------------------------------ */
 /* shell pieces                                                        */
 /* ------------------------------------------------------------------ */
-function Masthead({ onHome }: { onHome: () => void }) {
+function Masthead({ onHome, onSteps }: { onHome: () => void; onSteps?: () => void }) {
   return (
     <header className="masthead">
       <div className="masthead-inner">
@@ -386,9 +424,12 @@ function Masthead({ onHome }: { onHome: () => void }) {
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src="/brand/logo.svg" alt="Stress Free Property Management" width={1280} height={240} />
         </button>
-        <a className="masthead-call" href={`tel:${OFFICE_PHONE_TEL}`} aria-label={`Call the office, ${OFFICE_PHONE_DISPLAY}`}>
-          <IconPhone size={18} /><span className="masthead-call-text">{OFFICE_PHONE_DISPLAY}</span>
-        </a>
+        <div className="masthead-tools">
+          {onSteps && <button type="button" className="masthead-call masthead-steps" onClick={onSteps}><IconList size={18} /><span>Steps</span></button>}
+          <a className="masthead-call" href={`tel:${OFFICE_PHONE_TEL}`} aria-label={`Call the office, ${OFFICE_PHONE_DISPLAY}`}>
+            <IconPhone size={18} /><span className="masthead-call-text">{OFFICE_PHONE_DISPLAY}</span>
+          </a>
+        </div>
       </div>
     </header>
   );
@@ -401,7 +442,7 @@ function TrustLine() {
     </div>
   );
 }
-function Lightbox({ id, onClose }: { id: string; onClose: () => void }) {
+function Lightbox({ id, onClose, onRemove }: { id: string; onClose: () => void; onRemove?: () => void }) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => { photoUrl(id, false).then(setSrc); }, [id]);
   return (
@@ -409,15 +450,15 @@ function Lightbox({ id, onClose }: { id: string; onClose: () => void }) {
       {/* eslint-disable-next-line @next/next/no-img-element */}
       {src && <img src={src} alt="Inspection photo, full size" />}
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Close photo"><IconClose size={22} /></button>
+      {onRemove && <button type="button" className="btn btn-quiet lightbox-remove" onClick={(e) => { e.stopPropagation(); onRemove(); }}>Remove this photo</button>}
     </div>
   );
 }
 
-function Field({ id, label, optional, hint, error, children }: { id: string; label: string; optional?: boolean; hint?: string; error?: string; children: ReactNode }) {
+function Field({ id, label, optional, error, className, children }: { id: string; label: string; optional?: boolean; error?: string; className?: string; children: ReactNode }) {
   return (
-    <div className={`field${error ? " has-error" : ""}`}>
+    <div className={`field field-c${error ? " has-error" : ""}${className ? ` ${className}` : ""}`}>
       <label className="field-label" htmlFor={id}>{label}{optional && <span className="field-optional"> (optional)</span>}</label>
-      {hint && <p className="field-hint" id={`${id}-hint`}>{hint}</p>}
       {children}
       {error && <p className="field-error" id={`${id}-error`}>{error}</p>}
     </div>
@@ -430,41 +471,42 @@ function Field({ id, label, optional, hint, error, children }: { id: string; lab
 function Landing({ draft, onStart, onResume, onSaved }: { draft: Report | null; onStart: (t: InspectionType) => void; onResume: () => void; onSaved: () => void }) {
   const progress = draft ? (() => { const s = stepsFor(draft); const i = s.findIndex((x) => x.key === draft.screen); return `Step ${Math.max(1, i + 1)} of ${s.length}`; })() : "";
   return (
-    <div className="flow landing step">
+    <div className="screen landing step">
       <div className="landing-intro">
         <p className="eyebrow">Unit inspections</p>
         <h1 className="mobile-title">Condition inspection</h1>
-        <p className="mobile-lede">Choose the inspection. Each one walks the unit room by room and ends with signatures and a PDF report.</p>
       </div>
 
       {draft && (
-        <div className="resume">
-          <p className="eyebrow eyebrow-accent">In progress</p>
-          <p className="resume-title">{typeLabel(draft.type)} · {addressLine(draft.details) || "No address yet"}</p>
-          <p className="resume-meta tnum">{progress} · started {fmtDateTime(draft.createdAt)}</p>
-          <button type="button" className="btn btn-primary btn-block" onClick={onResume}><span>Resume</span><IconArrowRight size={20} /></button>
-        </div>
+        <button type="button" className="resume" onClick={onResume}>
+          <span className="resume-text">
+            <span className="eyebrow eyebrow-accent">Continue · {typeLabel(draft.type)}</span>
+            <span className="resume-title">{addressLine(draft.details) || "No address yet"}</span>
+            <span className="resume-meta tnum">{progress} · started {fmtDateTime(draft.createdAt)}</span>
+          </span>
+          <IconArrowRight size={22} />
+        </button>
       )}
 
       <div className="big-choices">
         <button type="button" className="big-choice" onClick={() => onStart("in")}>
           <span className="big-kicker">Start of tenancy</span>
           <span className="big-label">Move In</span>
-          <span className="big-sub">Record the condition of every room before the tenant moves in.</span>
+          <span className="big-sub">Record every room before the tenant moves in.</span>
           <span className="big-arrow" aria-hidden="true"><IconArrowRight size={26} /></span>
         </button>
         <button type="button" className="big-choice big-choice-alt" onClick={() => onStart("out")}>
           <span className="big-kicker">End of tenancy</span>
           <span className="big-label">Move Out</span>
-          <span className="big-sub">Load the move-in report and note what has changed.</span>
+          <span className="big-sub">Load the move-in and note what changed.</span>
           <span className="big-arrow" aria-hidden="true"><IconArrowRight size={26} /></span>
         </button>
       </div>
 
       <button type="button" className="saved-link" onClick={onSaved}>
-        <span>Saved on this device</span><span className="saved-sub">Open, download or delete completed reports</span><IconArrowRight size={18} />
+        <span>Saved reports</span><span className="saved-sub">Completed inspections on this phone</span><IconArrowRight size={18} />
       </button>
-      <div className="mobile-trust"><TrustLine /></div>
+      <p className="mobile-trust trust-row"><IconShield size={18} /> Stays on this phone. Nothing is uploaded. <a href={PRIVACY_URL} target="_blank" rel="noopener">Privacy</a></p>
     </div>
   );
 }
@@ -472,27 +514,33 @@ function Landing({ draft, onStart, onResume, onSaved }: { draft: Report | null; 
 function SavedList({ list, onOpen, onBack, onImport }: { list: Report[]; onOpen: (r: Report) => void; onBack: () => void; onImport: (text: string) => void }) {
   const file = useRef<HTMLInputElement>(null);
   return (
-    <div className="flow step">
-      <p className="eyebrow">This device</p>
-      <h2 className="step-title">Saved reports</h2>
-      <div className="step-body stack-lg">
+    <div className="screen flow">
+      <header className="screen-head">
+        <div className="screen-head-text">
+          <p className="screen-eyebrow">This phone</p>
+          <h2 className="screen-title">Saved reports</h2>
+        </div>
+      </header>
+      <div className="screen-body step">
         {list.length ? (
           <ul className="report-list">
             {list.map((r) => (
               <li key={r.id}>
                 <button type="button" className="report-row" onClick={() => onOpen(r)}>
-                  <span className="report-type">{typeLabel(r.type)}</span>
+                  <span className="report-type">{typeLabel(r.type)} · {fmtDate(r.details.date)}</span>
                   <span className="report-addr">{addressLine(r.details)}</span>
-                  <span className="report-meta tnum">{fmtDate(r.details.date)} · {r.details.tenants} · {r.id}</span>
+                  <span className="report-meta tnum">{r.details.tenants} · {r.id}</span>
                 </button>
               </li>
             ))}
           </ul>
-        ) : <p className="review-empty">No completed reports on this device yet.</p>}
-        <div className="stack-md">
-          <button type="button" className="btn btn-quiet btn-block" onClick={() => file.current?.click()}>Open a saved move-in file (.json)</button>
-          <input ref={file} type="file" accept=".json,application/json" hidden onChange={async (e) => { const f = e.target.files?.[0]; if (f) onImport(await f.text()); e.target.value = ""; }} />
-          <button type="button" className="btn btn-ghost" onClick={onBack}><IconArrowLeft size={20} /><span>Back</span></button>
+        ) : <p className="review-empty">No completed reports on this phone yet.</p>}
+        <input ref={file} type="file" accept=".json,application/json" hidden onChange={async (e) => { const f = e.target.files?.[0]; if (f) onImport(await f.text()); e.target.value = ""; }} />
+      </div>
+      <div className="bar">
+        <div className="bar-inner">
+          <button type="button" className="btn btn-ghost bar-back" onClick={onBack}><IconArrowLeft size={20} /><span>Back</span></button>
+          <button type="button" className="btn btn-quiet bar-next" onClick={() => file.current?.click()}>Open a move-in file</button>
         </div>
       </div>
     </div>
@@ -523,34 +571,28 @@ function BaselineStep({ r, update, setDialog }: { r: Report; update: Upd; setDia
     catch (err) { setDialog({ title: "File not loaded", body: <p>{(err as Error).message}</p>, actions: [{ label: "OK", kind: "primary", run: () => setDialog(null) }] }); }
   };
   return (
-    <div className="stack-lg">
-      <p className="lede-sm">Loading the move-in report fills in the address, tenants and rooms, and shows the move-in condition next to every item so changes stand out.</p>
+    <div className="stack-sm">
+      <p className="lede-sm">Fills in the address, tenants and rooms, and shows the move-in condition on every item.</p>
       {r.baselineRef && (
-        <div className="note note-ok"><IconCheck size={18} /><span>Loaded move-in report <strong>{r.baselineRef.id}</strong> from {fmtDate(r.baselineRef.date)}. <button type="button" className="link" onClick={() => update((cur) => detachBaseline(cur))}>Remove</button></span></div>
+        <div className="note note-ok"><IconCheck size={18} /><span>Loaded <strong>{r.baselineRef.id}</strong> ({fmtDate(r.baselineRef.date)}). <button type="button" className="link" onClick={() => update((cur) => detachBaseline(cur))}>Remove</button></span></div>
       )}
-      <fieldset className="group">
-        <legend className="group-label">Saved on this device</legend>
-        {list === null ? <p className="review-empty">Looking…</p> : list.length ? (
-          <ul className="report-list">
-            {list.map((mi) => (
-              <li key={mi.id}>
-                <button type="button" className={`report-row${r.baselineRef?.id === mi.id ? " is-selected" : ""}`} onClick={() => use(mi)}>
-                  <span className="report-type">Move-in · {fmtDate(mi.details.date)}</span>
-                  <span className="report-addr">{addressLine(mi.details)}</span>
-                  <span className="report-meta tnum">{mi.details.tenants} · {mi.id}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : <p className="review-empty">No move-in reports on this device.</p>}
-      </fieldset>
-      <fieldset className="group">
-        <legend className="group-label">From a file</legend>
-        <button type="button" className="btn btn-quiet btn-block" onClick={() => file.current?.click()}>Open the move-in file (.json)</button>
-        <p className="field-hint hint-after">The file saved at the end of the move-in, from email, Drive, Files or AirDrop.</p>
-        <input ref={file} type="file" accept=".json,application/json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void fromFile(f); e.target.value = ""; }} />
-      </fieldset>
-      {!r.baselineRef && <p className="lede-sm">No move-in report? Tap Continue to do the move-out on its own.</p>}
+      <p className="group-label">On this phone</p>
+      {list === null ? <p className="review-empty">Looking…</p> : list.length ? (
+        <ul className="report-list">
+          {list.map((mi) => (
+            <li key={mi.id}>
+              <button type="button" className={`report-row${r.baselineRef?.id === mi.id ? " is-selected" : ""}`} onClick={() => use(mi)}>
+                <span className="report-type">Move-in · {fmtDate(mi.details.date)}</span>
+                <span className="report-addr">{addressLine(mi.details)}</span>
+                <span className="report-meta tnum">{mi.details.tenants} · {mi.id}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : <p className="review-empty">No move-in reports on this phone.</p>}
+      <button type="button" className="btn btn-quiet btn-block" onClick={() => file.current?.click()}>Open the move-in file (.json)</button>
+      <input ref={file} type="file" accept=".json,application/json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void fromFile(f); e.target.value = ""; }} />
+      {!r.baselineRef && <p className="fine">No move-in report? Tap Next to do the move-out on its own.</p>}
     </div>
   );
 }
@@ -559,41 +601,35 @@ function DetailsStep({ r, update, errors }: { r: Report; update: Upd; errors: Re
   const d = r.details;
   const set = (k: keyof Report["details"], v: string | boolean) => update((cur) => ({ ...cur, details: { ...cur.details, [k]: v } }));
   return (
-    <div className="stack-md">
-      <div className="grid-address">
-        <Field id="address" label="Property address" error={errors.address}>
-          <input id="address" type="text" autoComplete="street-address" value={d.address} onChange={(e) => set("address", e.target.value)} aria-invalid={!!errors.address} />
-        </Field>
-        <Field id="unit" label="Unit" optional>
-          <input id="unit" type="text" value={d.unit} onChange={(e) => set("unit", e.target.value)} />
-        </Field>
-      </div>
+    <div className="form-grid">
+      <Field id="address" label="Address" error={errors.address} className="span-2">
+        <input id="address" type="text" autoComplete="street-address" placeholder="Street address" value={d.address} onChange={(e) => set("address", e.target.value)} aria-invalid={!!errors.address} />
+      </Field>
+      <Field id="unit" label="Unit" optional>
+        <input id="unit" type="text" value={d.unit} onChange={(e) => set("unit", e.target.value)} />
+      </Field>
       <Field id="city" label="City" optional>
         <input id="city" type="text" autoComplete="address-level2" value={d.city} onChange={(e) => set("city", e.target.value)} />
       </Field>
-      <Field id="tenants" label="Tenant name(s)" hint="Separate names with commas." error={errors.tenants}>
-        <input id="tenants" type="text" autoComplete="off" value={d.tenants} onChange={(e) => set("tenants", e.target.value)} aria-invalid={!!errors.tenants} />
+      <Field id="tenants" label="Tenant(s)" error={errors.tenants} className="span-2">
+        <input id="tenants" type="text" autoComplete="off" placeholder="Names, separated by commas" value={d.tenants} onChange={(e) => set("tenants", e.target.value)} aria-invalid={!!errors.tenants} />
       </Field>
-      <div className="grid-2">
-        <Field id="inspector" label="Inspected by" error={errors.inspector}>
-          <input id="inspector" type="text" autoComplete="name" value={d.inspector} onChange={(e) => set("inspector", e.target.value)} aria-invalid={!!errors.inspector} />
-        </Field>
-        <Field id="date" label="Inspection date" error={errors.date}>
-          <input id="date" type="date" value={d.date} onChange={(e) => set("date", e.target.value)} aria-invalid={!!errors.date} />
-        </Field>
-      </div>
-      <div className="checks">
-        <label className="check">
-          <input type="checkbox" checked={d.tenantPresent} onChange={(e) => set("tenantPresent", e.target.checked)} />
-          <span className="check-box" aria-hidden="true"><IconCheck size={14} /></span>
-          <span className="check-text"><span className="check-label">Tenant present for the inspection</span><span className="check-hint">Untick if the inspection is done without the tenant.</span></span>
-        </label>
-      </div>
+      <Field id="inspector" label="Inspector" error={errors.inspector}>
+        <input id="inspector" type="text" autoComplete="name" value={d.inspector} onChange={(e) => set("inspector", e.target.value)} aria-invalid={!!errors.inspector} />
+      </Field>
+      <Field id="date" label="Date" error={errors.date}>
+        <input id="date" type="date" value={d.date} onChange={(e) => set("date", e.target.value)} aria-invalid={!!errors.date} />
+      </Field>
       {r.type === "out" && (
-        <Field id="fwd" label="Tenant forwarding address" optional>
+        <Field id="fwd" label="Tenant forwarding address" optional className="span-2">
           <input id="fwd" type="text" value={d.forwardingAddress} onChange={(e) => set("forwardingAddress", e.target.value)} />
         </Field>
       )}
+      <label className="check check-row span-2">
+        <input type="checkbox" checked={d.tenantPresent} onChange={(e) => set("tenantPresent", e.target.checked)} />
+        <span className="check-box" aria-hidden="true"><IconCheck size={14} /></span>
+        <span className="check-text"><span className="check-label">Tenant is here for the inspection</span></span>
+      </label>
     </div>
   );
 }
@@ -624,31 +660,40 @@ function LayoutStep({ r, update, setDialog }: { r: Report; update: Upd; setDialo
   const fixed = ["entry", "kitchen", "systems", "keys", "meters"];
   const toggles = ROOM_DEFS.filter((d) => !d.group?.match(/^(bedroom|bathroom)$/) && !fixed.includes(d.key));
   return (
-    <div className="stack-lg">
-      <p className="lede-sm">Set the rooms once. Each room becomes one screen of the checklist.</p>
-      <div className="counts">
-        <div className="count-row"><span className="count-label">Bedrooms</span><Stepper label="Bedrooms" value={count("bedroom")} min={0} max={8} onChange={(n) => setGroup("bedroom", n)} /></div>
-        <div className="count-row"><span className="count-label">Bathrooms</span><Stepper label="Bathrooms" value={count("bathroom")} min={0} max={6} onChange={(n) => setGroup("bathroom", n)} /></div>
+    <div className="stack-sm">
+      <div className="counts-grid">
+        <div className="count-cell"><span className="count-label">Bedrooms</span><Stepper label="Bedrooms" value={count("bedroom")} min={0} max={8} onChange={(n) => setGroup("bedroom", n)} /></div>
+        <div className="count-cell"><span className="count-label">Bathrooms</span><Stepper label="Bathrooms" value={count("bathroom")} min={0} max={6} onChange={(n) => setGroup("bathroom", n)} /></div>
       </div>
-      <fieldset className="group">
-        <legend className="group-label">Other areas</legend>
-        <div className="checks">
-          {toggles.map((d) => {
-            const room = r.rooms.find((x) => x.group === d.key);
-            return (
-              <label key={d.key} className="check">
-                <input type="checkbox" checked={!!room} onChange={(e) => {
-                  if (e.target.checked) update((x) => ({ ...x, rooms: insertRoom(x.rooms, d.key).map((rm) => (rm.group === d.key && x.baselineRef ? { ...rm, addedAtMoveOut: true } : rm)) }));
-                  else if (room) confirmRemove(room, () => update((x) => ({ ...x, rooms: x.rooms.filter((y) => y.id !== room.id) })));
-                }} />
-                <span className="check-box" aria-hidden="true"><IconCheck size={14} /></span>
-                <span className="check-text"><span className="check-label">{d.name}</span></span>
-              </label>
-            );
-          })}
-        </div>
-      </fieldset>
-      <p className="field-hint">Always included: Entry and hall, Kitchen, Systems and safety, Keys and remotes, Meter readings. Any item that does not apply can be marked N/A.</p>
+      <p className="group-label">Other areas</p>
+      <div className="toggle-grid">
+        {toggles.map((d) => {
+          const room = r.rooms.find((x) => x.group === d.key);
+          return (
+            <label key={d.key} className="toggle">
+              <input type="checkbox" checked={!!room} onChange={(e) => {
+                if (e.target.checked) update((x) => ({ ...x, rooms: insertRoom(x.rooms, d.key).map((rm) => (rm.group === d.key && x.baselineRef ? { ...rm, addedAtMoveOut: true } : rm)) }));
+                else if (room) confirmRemove(room, () => update((x) => ({ ...x, rooms: x.rooms.filter((y) => y.id !== room.id) })));
+              }} />
+              <span className="check-box" aria-hidden="true"><IconCheck size={14} /></span>
+              <span className="toggle-label">{d.name.replace("Basement / storage / locker", "Storage / locker")}</span>
+            </label>
+          );
+        })}
+      </div>
+      <p className="fine">Always included: entry, kitchen, systems and safety, keys, meters. {r.rooms.length} screens in total.</p>
+    </div>
+  );
+}
+
+function MarkAll({ room, onMark }: { room: Room; onMark: () => void }) {
+  const left = unmarked(room);
+  return (
+    <div className="markall">
+      <button type="button" className={`btn btn-sm ${left ? "btn-primary" : "btn-done"}`} onClick={onMark} disabled={!left}>
+        <IconCheck size={18} /><span>{!left ? "All marked" : left === room.items.length ? "All Good" : `Rest Good (${left})`}</span>
+      </button>
+      <span className="markall-meta tnum">{room.items.length - left}/{room.items.length} marked</span>
     </div>
   );
 }
@@ -657,170 +702,172 @@ interface RoomProps {
   r: Report; room: Room;
   patchRoom: (id: string, fn: (room: Room) => Room) => void;
   patchItem: (roomId: string, itemId: string, patch: Partial<Item>) => void;
-  markAllGood: (roomId: string) => void;
   addPhotos: (files: File[], attach: (ids: string[]) => void) => Promise<void>;
   removePhoto: (id: string, detach: () => void) => void;
-  onOpen: (id: string) => void;
+  onOpen: Opener;
 }
 
-function RoomStep({ r, room, patchRoom, patchItem, markAllGood, addPhotos, removePhoto, onOpen }: RoomProps) {
+function RoomStep({ r, room, patchRoom, patchItem, addPhotos, removePhoto, onOpen }: RoomProps) {
   const [newItem, setNewItem] = useState("");
-  const left = unmarked(room);
+  const [adding, setAdding] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(!!room.notes);
   const compare = r.type === "out" && !!r.baselineRef;
-  const addItem = () => { const l = newItem.trim(); if (!l) return; patchRoom(room.id, (x) => ({ ...x, items: [...x.items, makeItem(l, true)] })); setNewItem(""); };
+  const addItem = () => { const l = newItem.trim(); if (!l) return; patchRoom(room.id, (x) => ({ ...x, items: [...x.items, makeItem(l, true)] })); setNewItem(""); setAdding(false); };
   const attachTo = (itemId: string) => (ids: string[]) => patchRoom(room.id, (x) => ({ ...x, items: x.items.map((i) => (i.id === itemId ? { ...i, photoIds: [...i.photoIds, ...ids] } : i)) }));
 
   return (
-    <div className="stack-lg">
-      {room.addedAtMoveOut && <p className="note">This room was not on the move-in report.</p>}
-      {room.kind === "std" && (
-        <div className="allgood">
-          <button type="button" className={`btn btn-block ${left ? "btn-quiet" : "btn-done"}`} onClick={() => markAllGood(room.id)} disabled={!left}>
-            <IconCheck size={20} /><span>{!left ? "All items marked" : left === room.items.length ? "Mark all Good" : `Mark the other ${left} Good`}</span>
-          </button>
-          <p className="allgood-meta tnum">{room.items.length - left} of {room.items.length} marked{left && left < room.items.length ? " · tap any exception first, then mark the rest" : ""}</p>
-        </div>
-      )}
-      {room.kind === "keys" && <p className="lede-sm">{compare ? "Count what the tenant hands back. The number issued at move-in is shown for each." : "Record how many of each the tenant receives."}</p>}
-      {room.kind === "meters" && <p className="lede-sm">Enter each reading and take a photo of the meter face. If a utility is included in rent or not separately metered, say so in the note.</p>}
-
-      <ul className="items">
+    <div className="room-scroll">
+      {room.addedAtMoveOut && <p className="note note-tight">Not on the move-in report.</p>}
+      {room.kind === "keys" && <p className="fine fine-top">{compare ? "Count what is handed back. Issued at move-in shown on each." : "How many of each the tenant receives."}</p>}
+      {room.kind === "meters" && <p className="fine fine-top">Reading plus a photo of each meter. Not metered? Say so in a note.</p>}
+      <ul className="rows">
         {room.items.map((it) => (
           <ItemRow key={it.id} it={it} room={room} compare={compare}
             onPatch={(p) => patchItem(room.id, it.id, p)}
             onRemove={it.custom ? () => patchRoom(room.id, (x) => ({ ...x, items: x.items.filter((i) => i.id !== it.id) })) : undefined}
             onAddPhotos={(files) => addPhotos(files, attachTo(it.id))}
-            onRemovePhoto={(pid) => removePhoto(pid, () => patchItem(room.id, it.id, { photoIds: it.photoIds.filter((x) => x !== pid) }))}
+            onRemovePhoto={(pid) => removePhoto(pid, () => patchRoom(room.id, (x) => ({ ...x, items: x.items.map((i) => (i.id === it.id ? { ...i, photoIds: i.photoIds.filter((p) => p !== pid) } : i)) })))}
             onOpen={onOpen} />
         ))}
       </ul>
 
-      <div className="add-item">
-        <label className="field-label" htmlFor={`add-${room.id}`}>Add an item</label>
-        <div className="add-item-row">
-          <input id={`add-${room.id}`} type="text" value={newItem} placeholder={room.kind === "keys" ? "e.g. Garage key" : "e.g. Wine fridge"} onChange={(e) => setNewItem(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addItem(); } }} />
-          <button type="button" className="btn btn-quiet" onClick={addItem} disabled={!newItem.trim()}>Add</button>
-        </div>
-      </div>
-
-      {room.kind === "std" && (
-        <>
-          <Field id={`notes-${room.id}`} label="Room notes" optional>
-            <textarea id={`notes-${room.id}`} className="ta-sm" value={room.notes} onChange={(e) => patchRoom(room.id, (x) => ({ ...x, notes: e.target.value }))} />
-          </Field>
-          <div>
-            <p className="field-label">Overview photos <span className="field-optional">(optional)</span></p>
-            <p className="field-hint">One or two wide shots of the whole room.</p>
-            <PhotoStrip ids={room.photoIds} label={`${room.name} overview`} onOpen={onOpen}
-              onAdd={(files) => addPhotos(files, (ids) => patchRoom(room.id, (x) => ({ ...x, photoIds: [...x.photoIds, ...ids] })))}
-              onRemove={(pid) => removePhoto(pid, () => patchRoom(room.id, (x) => ({ ...x, photoIds: x.photoIds.filter((p) => p !== pid) })))} />
+      <div className="room-tools">
+        {adding ? (
+          <div className="add-item-row">
+            <label className="sr-only" htmlFor={`add-${room.id}`}>New item</label>
+            <input id={`add-${room.id}`} type="text" autoFocus value={newItem} placeholder={room.kind === "keys" ? "e.g. Garage key" : "e.g. Wine fridge"} onChange={(e) => setNewItem(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addItem(); } }} />
+            <button type="button" className="btn btn-quiet btn-sm" onClick={addItem} disabled={!newItem.trim()}>Add</button>
+            <button type="button" className="icon-btn" onClick={() => { setAdding(false); setNewItem(""); }} aria-label="Cancel"><IconClose size={18} /></button>
           </div>
-        </>
-      )}
+        ) : (
+          <div className="tool-row">
+            <button type="button" className="btn btn-quiet btn-sm" onClick={() => setAdding(true)}>+ Item</button>
+            {room.kind === "std" && <button type="button" className={`btn btn-quiet btn-sm${room.notes ? " has-value" : ""}`} onClick={() => setNotesOpen((o) => !o)}><IconNote size={18} /><span>Room note</span></button>}
+            {room.kind === "std" && (
+              <PhotoStrip inline ids={room.photoIds} label={`${room.name} overview`} buttonLabel="Room photo" onOpen={onOpen}
+                onAdd={(files) => addPhotos(files, (ids) => patchRoom(room.id, (x) => ({ ...x, photoIds: [...x.photoIds, ...ids] })))}
+                onRemove={(pid) => removePhoto(pid, () => patchRoom(room.id, (x) => ({ ...x, photoIds: x.photoIds.filter((p) => p !== pid) })))} />
+            )}
+          </div>
+        )}
+        {room.kind === "std" && notesOpen && (
+          <div className="field">
+            <label className="sr-only" htmlFor={`notes-${room.id}`}>Room notes</label>
+            <textarea id={`notes-${room.id}`} className="ta-xs" placeholder="Notes for the whole room" value={room.notes} onChange={(e) => patchRoom(room.id, (x) => ({ ...x, notes: e.target.value }))} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
 function ItemRow({ it, room, compare, onPatch, onRemove, onAddPhotos, onRemovePhoto, onOpen }: {
   it: Item; room: Room; compare: boolean; onPatch: (p: Partial<Item>) => void; onRemove?: () => void;
-  onAddPhotos: (f: File[]) => Promise<void>; onRemovePhoto: (id: string) => void; onOpen: (id: string) => void;
+  onAddPhotos: (f: File[]) => Promise<void>; onRemovePhoto: (id: string) => void; onOpen: Opener;
 }) {
   const flagged = it.cond === "fair" || it.cond === "poor";
-  const [open, setOpen] = useState(!!(it.comment || it.photoIds.length || it.cost));
+  const [open, setOpen] = useState<boolean | null>(null);
   const ch = itemChange(it, room.kind);
-  const show = open || flagged;
-  const name = `c-${it.id}`;
+  const show = open ?? flagged;
   const b = it.before;
+  const hasBeforeDetail = !!b && (!!b.comment || b.issues.length > 0 || b.photoIds.length > 0);
+  const extras = it.photoIds.length + (it.comment ? 1 : 0);
 
-  const head = (
-    <div className="item-head">
-      <span className="item-label" id={`l-${it.id}`}>{it.label}</span>
-      {ch === "worse" && <span className="flag flag-worse">{room.kind === "keys" ? "Not all returned" : "Worse than move-in"}</span>}
-      {ch === "better" && <span className="flag">{room.kind === "keys" ? "More returned" : "Better than move-in"}</span>}
-      {onRemove && <button type="button" className="link item-remove" onClick={onRemove} aria-label={`Remove ${it.label}`}>Remove</button>}
-    </div>
+  const badge = compare ? (
+    <span className={`was${ch === "worse" ? " is-worse" : ch === "better" ? " is-better" : ""}`}>
+      {room.kind === "keys" ? `issued ${b?.count || "0"}` : room.kind === "meters" ? (b?.reading ? `was ${b.reading}` : "no move-in reading")
+        : b ? `was ${condLabel(b.cond)}` : "new"}
+      {ch === "worse" && (room.kind === "keys" ? " · short" : " · worse")}
+      {ch === "better" && " · better"}
+      {hasBeforeDetail && <IconCamera size={13} className="was-cam" />}
+    </span>
+  ) : null;
+
+  const label = (
+    <button type="button" className="row-label" onClick={() => setOpen(!show)} aria-expanded={show} id={`l-${it.id}`}>
+      <span className="row-name">{it.label}</span>
+      {badge}
+      {!show && extras > 0 && <span className="row-has" aria-label={`${extras} note or photo`}>{it.comment && <IconNote size={14} />}{it.photoIds.length > 0 && <IconCamera size={14} />}</span>}
+    </button>
   );
-  const beforeLine = compare && b ? (
+  const beforeDetail = show && compare && hasBeforeDetail && b ? (
     <div className="before">
       <span className="before-k">Move-in</span>
-      <span className="before-v">
-        {room.kind === "keys" ? `${b.count || "0"} issued` : room.kind === "meters" ? (b.reading || "No reading") : condLabel(b.cond)}
-        {b.issues.length > 0 && ` · ${b.issues.join(", ").toLowerCase()}`}{b.comment && ` · ${b.comment}`}
-      </span>
-      {b.photoIds.length > 0 && <span className="before-ph">{b.photoIds.slice(0, 3).map((p) => <Thumb key={p} id={p} alt={`${it.label} at move-in`} onOpen={onOpen} />)}</span>}
+      <span className="before-v">{condLabel(b.cond)}{b.issues.length > 0 && ` · ${b.issues.join(", ").toLowerCase()}`}{b.comment && ` · ${b.comment}`}</span>
+      {b.photoIds.length > 0 && <span className="before-ph">{b.photoIds.slice(0, 3).map((p) => <Thumb key={p} id={p} alt={`${it.label} at move-in`} onOpen={(id) => onOpen(id)} />)}</span>}
     </div>
-  ) : compare && room.kind !== "meters" ? <div className="before"><span className="before-k">Move-in</span><span className="before-v">Not recorded</span></div> : null;
-
-  const noteField = (
-    <div className="field">
+  ) : null;
+  const note = (
+    <>
       <label className="sr-only" htmlFor={`n-${it.id}`}>Note for {it.label}</label>
-      <textarea id={`n-${it.id}`} className="note-input" rows={it.comment.length > 34 ? 3 : 1} placeholder={flagged ? "Describe it: where, how big" : "Note"} value={it.comment} onChange={(e) => onPatch({ comment: e.target.value })} />
-    </div>
+      <input id={`n-${it.id}`} className="row-note" type="text" enterKeyHint="done" placeholder={flagged ? "What and where" : "Note"} value={it.comment} onChange={(e) => onPatch({ comment: e.target.value })} />
+    </>
   );
+  const removeBtn = onRemove ? <button type="button" className="link row-remove" onClick={onRemove}>Remove item</button> : null;
 
   if (room.kind === "keys") {
     const n = parseInt(it.count || "0", 10) || 0;
     return (
-      <li className="item">
-        {head}{beforeLine}
-        <div className="key-row">
-          <span className="key-k">{compare ? "Returned" : "Issued"}</span>
-          <Stepper label={it.label} value={n} min={0} max={20} onChange={(v) => onPatch({ count: String(v) })} />
-        </div>
-        {show ? noteField : <button type="button" className="link item-more" onClick={() => setOpen(true)}>Add note</button>}
+      <li className={`row${ch === "worse" ? " is-worse" : ""}`}>
+        <div className="row-main">{label}<Stepper label={it.label} value={n} min={0} max={20} onChange={(v) => onPatch({ count: String(v) })} /></div>
+        {show && <div className="row-extra"><div className="row-tools">{note}</div>{removeBtn}</div>}
       </li>
     );
   }
   if (room.kind === "meters") {
     return (
-      <li className="item">
-        {head}{beforeLine}
-        <div className="field">
+      <li className="row">
+        <div className="row-main">
+          {label}
           <label className="sr-only" htmlFor={`m-${it.id}`}>{it.label} reading</label>
-          <input id={`m-${it.id}`} type="text" inputMode="decimal" placeholder="Reading" value={it.reading ?? ""} onChange={(e) => onPatch({ reading: e.target.value })} />
+          <input id={`m-${it.id}`} className="row-reading tnum" type="text" inputMode="decimal" placeholder="Reading" value={it.reading ?? ""} onChange={(e) => onPatch({ reading: e.target.value })} />
+          <PhotoStrip inline ids={it.photoIds} label={it.label} onAdd={onAddPhotos} onRemove={onRemovePhoto} onOpen={onOpen} />
         </div>
-        {noteField}
-        <PhotoStrip compact ids={it.photoIds} label={it.label} onAdd={onAddPhotos} onRemove={onRemovePhoto} onOpen={onOpen} />
+        {show && <div className="row-extra"><div className="row-tools">{note}</div>{removeBtn}</div>}
       </li>
     );
   }
 
   return (
-    <li className={`item${flagged ? " is-flagged" : ""}`}>
-      {head}{beforeLine}
-      <div className="seg" role="radiogroup" aria-labelledby={`l-${it.id}`}>
-        {CONDITIONS.map((c) => (
-          <label key={c.value} className={`seg-opt seg-${c.value}`}>
-            <input type="radio" name={name} value={c.value} checked={it.cond === c.value}
-              onChange={() => onPatch({ cond: c.value, issues: c.value === "fair" || c.value === "poor" ? it.issues : [] })} />
-            <span>{c.label}</span>
-          </label>
-        ))}
-      </div>
-      {flagged && (
-        <div className="chips chips-sm" role="group" aria-label={`What is wrong with ${it.label}`}>
-          {ISSUES.map((s) => (
-            <label key={s} className="chip">
-              <input type="checkbox" checked={it.issues.includes(s)} onChange={() => onPatch({ issues: it.issues.includes(s) ? it.issues.filter((x) => x !== s) : [...it.issues, s] })} />
-              <span className="chip-tick" aria-hidden="true"><IconCheck size={14} /></span>{s}
+    <li className={`row${flagged ? " is-flagged" : ""}${ch === "worse" ? " is-worse" : ""}`}>
+      <div className="row-main">
+        {label}
+        <div className="seg seg-inline" role="radiogroup" aria-labelledby={`l-${it.id}`}>
+          {CONDITIONS.map((c) => (
+            <label key={c.value} className={`seg-opt seg-${c.value}${compare && b?.cond === c.value ? " is-was" : ""}`}>
+              <input type="radio" name={`c-${it.id}`} value={c.value} checked={it.cond === c.value}
+                onChange={() => { onPatch({ cond: c.value, issues: c.value === "fair" || c.value === "poor" ? it.issues : [] }); if (c.value === "fair" || c.value === "poor") setOpen(null); }} />
+              <span>{c.label}</span>
             </label>
           ))}
         </div>
-      )}
-      {show ? (
-        <div className="item-extra">
-          {noteField}
-          {compare && (flagged || ch === "worse") && (
-            <div className="field cost">
-              <label className="field-label" htmlFor={`cost-${it.id}`}>Estimated cost <span className="field-optional">(optional, for the office)</span></label>
-              <div className="cost-row"><span aria-hidden="true">$</span><input id={`cost-${it.id}`} type="text" inputMode="decimal" value={it.cost ?? ""} onChange={(e) => onPatch({ cost: e.target.value.replace(/[^0-9.]/g, "") })} /></div>
+      </div>
+      {show && (
+        <div className="row-extra">
+          {beforeDetail}
+          {flagged && (
+            <div className="chips chips-row" role="group" aria-label={`What is wrong with ${it.label}`}>
+              {ISSUES.map((s) => (
+                <label key={s} className="chip">
+                  <input type="checkbox" checked={it.issues.includes(s)} onChange={() => onPatch({ issues: it.issues.includes(s) ? it.issues.filter((x) => x !== s) : [...it.issues, s] })} />
+                  <span className="chip-tick" aria-hidden="true"><IconCheck size={14} /></span>{s}
+                </label>
+              ))}
             </div>
           )}
-          <PhotoStrip compact ids={it.photoIds} label={it.label} onAdd={onAddPhotos} onRemove={onRemovePhoto} onOpen={onOpen} />
+          <div className="row-tools">
+            {note}
+            {compare && (flagged || ch === "worse") && (
+              <span className="row-cost"><span aria-hidden="true">$</span>
+                <label className="sr-only" htmlFor={`cost-${it.id}`}>Estimated cost, optional, for the office</label>
+                <input id={`cost-${it.id}`} type="text" inputMode="decimal" placeholder="Est." value={it.cost ?? ""} onChange={(e) => onPatch({ cost: e.target.value.replace(/[^0-9.]/g, "") })} />
+              </span>
+            )}
+            <PhotoStrip inline ids={it.photoIds} label={it.label} onAdd={onAddPhotos} onRemove={onRemovePhoto} onOpen={onOpen} />
+          </div>
+          {removeBtn}
         </div>
-      ) : (
-        <button type="button" className="link item-more" onClick={() => setOpen(true)}>Add note or photo</button>
       )}
     </li>
   );
@@ -831,20 +878,20 @@ function NotesStep({ r, update }: { r: Report; update: Upd }) {
   const worse = r.rooms.flatMap((room) => room.items.filter((i) => itemChange(i, room.kind) === "worse").map((i) => `${room.name}: ${i.label}`));
   const total = r.rooms.flatMap((x) => x.items).reduce((s, i) => s + (parseFloat(i.cost || "") || 0), 0);
   return (
-    <div className="stack-md">
+    <div className="stack-sm">
       {r.baselineRef ? (
-        <div className={`note${worse.length ? " note-alert" : ""}`}>
-          <span>{worse.length ? `${worse.length} item${worse.length > 1 ? "s" : ""} recorded worse than at move-in: ${worse.join("; ")}.` : "No items recorded worse than at move-in."}</span>
-        </div>
-      ) : <p className="note">No move-in report was loaded, so there is no automatic comparison.</p>}
-      <Field id="cmp" label="Comparison with move-in" optional hint="Overall differences from the move-in condition.">
-        <textarea id="cmp" className="ta-sm" value={r.moveOut.comparison} onChange={(e) => set("comparison", e.target.value)} />
+        <p className={`note note-tight${worse.length ? " note-alert" : ""}`}>
+          {worse.length ? `${worse.length} worse than move-in: ${worse.join("; ")}.` : "Nothing recorded worse than at move-in."}{total ? ` Estimates: $${total.toFixed(2)}.` : ""}
+        </p>
+      ) : <p className="note note-tight">No move-in report loaded, so no automatic comparison.</p>}
+      <Field id="cmp" label="Compared with move-in" optional>
+        <textarea id="cmp" className="ta-xs" placeholder="Overall differences" value={r.moveOut.comparison} onChange={(e) => set("comparison", e.target.value)} />
       </Field>
-      <Field id="dmg" label="Damage noted" optional hint="What appears to be beyond normal wear and tear, in the inspector's view.">
-        <textarea id="dmg" className="ta-sm" value={r.moveOut.damages} onChange={(e) => set("damages", e.target.value)} />
+      <Field id="dmg" label="Damage noted" optional>
+        <textarea id="dmg" className="ta-xs" placeholder="Beyond normal wear, in the inspector's view" value={r.moveOut.damages} onChange={(e) => set("damages", e.target.value)} />
       </Field>
-      <Field id="chg" label="Charges note" optional hint={`Repairs or cleaning the office may follow up on.${total ? ` Item estimates so far: $${total.toFixed(2)}.` : ""}`}>
-        <textarea id="chg" className="ta-sm" value={r.moveOut.charges} onChange={(e) => set("charges", e.target.value)} />
+      <Field id="chg" label="Charges note" optional>
+        <textarea id="chg" className="ta-xs" placeholder="Repairs or cleaning to follow up" value={r.moveOut.charges} onChange={(e) => set("charges", e.target.value)} />
       </Field>
     </div>
   );
@@ -853,13 +900,19 @@ function NotesStep({ r, update }: { r: Report; update: Upd }) {
 function ReviewStep({ r, go }: { r: Report; go: (k: string) => void }) {
   const compare = r.type === "out" && !!r.baselineRef;
   const changes = r.rooms.flatMap((room) => room.items.filter((i) => itemChange(i, room.kind) === "worse").map((i) => ({ room, i })));
-  const blanks = r.rooms.filter((x) => unmarked(x) > 0);
+  const std = r.rooms.filter((x) => x.kind === "std");
+  const total = std.reduce((s, x) => s + x.items.length, 0);
+  const marked = total - std.reduce((s, x) => s + unmarked(x), 0);
+  const flagged = std.reduce((s, x) => s + x.items.filter((i) => i.cond === "fair" || i.cond === "poor").length, 0);
   const photos = r.rooms.reduce((s, x) => s + x.photoIds.length + x.items.reduce((a, i) => a + i.photoIds.length, 0), 0);
+  const blanks = r.rooms.filter((x) => unmarked(x) > 0);
   return (
-    <div className="stack-lg">
+    <div className="stack-sm">
+      <p className="review-line tnum"><strong>{marked}</strong> of {total} items marked · <strong>{flagged}</strong> Fair or Poor · <strong>{photos}</strong> photo{photos === 1 ? "" : "s"}</p>
+      {blanks.length > 0 && <p className="note note-tight note-alert">{total - marked} not marked. Tap a red room to finish it, or leave them as “Not marked”.</p>}
       {compare && (
         <section className={`review-block${changes.length ? " is-alert" : ""}`}>
-          <div className="review-head"><h3>Changes since move-in ({changes.length})</h3></div>
+          <div className="review-head"><h3>Worse than move-in ({changes.length})</h3></div>
           {changes.length ? (
             <ul className="change-list">
               {changes.map(({ room, i }) => (
@@ -869,39 +922,27 @@ function ReviewStep({ r, go }: { r: Report; go: (k: string) => void }) {
                 </button></li>
               ))}
             </ul>
-          ) : <p className="review-empty">No items recorded worse than at move-in.</p>}
+          ) : <p className="review-empty">Nothing recorded worse than at move-in.</p>}
         </section>
-      )}
-      {blanks.length > 0 && (
-        <p className="note note-alert">Not marked: {blanks.map((x) => `${x.name} (${unmarked(x)})`).join(", ")}. They appear as “Not marked” in the report.</p>
       )}
       <section className="review-block">
         <div className="review-head"><h3>Details</h3><button type="button" className="link link-edit" onClick={() => go("details")}>Edit</button></div>
-        <dl className="review-list">
-          <Row k="Property" v={addressLine(r.details)} />
-          <Row k="Tenant(s)" v={r.details.tenants} />
-          <Row k="Inspected by" v={r.details.inspector} />
-          <Row k="Date" v={fmtDate(r.details.date)} />
-          <Row k="Tenant present" v={r.details.tenantPresent ? "Yes" : "No"} />
-          {r.type === "out" && <Row k="Compared with" v={r.baselineRef ? r.baselineRef.id : "No move-in report"} />}
-          <Row k="Photos" v={String(photos)} />
-        </dl>
+        <p className="review-details">{addressLine(r.details)}<br /><span>{r.details.tenants} · {fmtDate(r.details.date)} · by {r.details.inspector}{r.details.tenantPresent ? "" : " · tenant not present"}{r.type === "out" ? ` · ${r.baselineRef ? `vs ${r.baselineRef.id}` : "no move-in report"}` : ""}</span></p>
       </section>
       <section className="review-block">
         <div className="review-head"><h3>Rooms ({r.rooms.length})</h3><button type="button" className="link link-edit" onClick={() => go("layout")}>Edit rooms</button></div>
-        <ul className="room-sum">
+        <ul className="room-grid">
           {r.rooms.map((room) => {
             const c = (k: string) => room.items.filter((i) => i.cond === k).length;
-            const meta = room.kind === "keys" ? room.items.filter((i) => i.count && i.count !== "0").map((i) => `${i.count} × ${i.label.toLowerCase()}`).join(", ") || "None recorded"
-              : room.kind === "meters" ? room.items.map((i) => `${i.label}: ${i.reading || "-"}`).join(" · ")
-              : [c("good") && `${c("good")} good`, c("fair") && `${c("fair")} fair`, c("poor") && `${c("poor")} poor`, c("na") && `${c("na")} n/a`, unmarked(room) && `${unmarked(room)} not marked`].filter(Boolean).join(" · ");
-            const issues = room.items.filter((i) => i.cond === "fair" || i.cond === "poor");
+            const left = unmarked(room);
+            const meta = room.kind === "keys" ? `${room.items.reduce((s, i) => s + (parseInt(i.count || "0", 10) || 0), 0)} keys/fobs`
+              : room.kind === "meters" ? `${room.items.filter((i) => i.reading).length} of ${room.items.length} read`
+              : left ? `${left} not marked` : c("fair") + c("poor") ? `${c("fair") + c("poor")} Fair/Poor` : "All Good";
             return (
               <li key={room.id}>
-                <button type="button" className="room-sum-row" onClick={() => go(`room:${room.id}`)}>
-                  <span className="room-sum-name">{room.name}</span>
-                  <span className={`room-sum-meta${unmarked(room) ? " is-alert" : ""}`}>{meta}</span>
-                  {issues.length > 0 && <span className="room-sum-issues">{issues.map((i) => `${i.label}: ${condLabel(i.cond)}${i.comment ? ` (${i.comment})` : ""}`).join("; ")}</span>}
+                <button type="button" className={`room-tile${left ? " is-alert" : c("fair") + c("poor") ? " is-flag" : ""}`} onClick={() => go(`room:${room.id}`)}>
+                  <span className="room-tile-name">{room.name}</span>
+                  <span className="room-tile-meta">{meta}</span>
                 </button>
               </li>
             );
@@ -911,86 +952,67 @@ function ReviewStep({ r, go }: { r: Report; go: (k: string) => void }) {
       {r.type === "out" && (
         <section className="review-block">
           <div className="review-head"><h3>Move-out notes</h3><button type="button" className="link link-edit" onClick={() => go("notes")}>Edit</button></div>
-          <dl className="review-list">
-            <Row k="Comparison" v={r.moveOut.comparison} />
-            <Row k="Damage" v={r.moveOut.damages} />
-            <Row k="Charges" v={r.moveOut.charges} />
-          </dl>
+          <p className="review-details"><span>{[r.moveOut.comparison, r.moveOut.damages, r.moveOut.charges].filter(Boolean).join(" · ") || "None"}</span></p>
         </section>
       )}
     </div>
   );
 }
-function Row({ k, v }: { k: string; v: string }) { return <div className="review-row"><dt>{k}</dt><dd>{v || "None"}</dd></div>; }
 
-function SignStep({ r, update, errors }: { r: Report; update: Upd; errors: Record<string, string> }) {
-  // keep one signature block per tenant name entered on the details screen
-  useEffect(() => {
-    const names = splitTenants(r.details.tenants);
-    if (r.tenantSigs.length === names.length && r.landlordSig) return;
-    update((cur) => ({
-      ...cur,
-      tenantSigs: names.map((n, i) => cur.tenantSigs[i] ?? { name: n, dataUrl: "", at: "", agree: "", reason: "" }),
-      landlordSig: cur.landlordSig ?? { name: cur.details.inspector, dataUrl: "", at: "" },
-    }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const setT = (i: number, p: Partial<TenantSignature>) => update((cur) => ({ ...cur, tenantSigs: cur.tenantSigs.map((s, j) => (j === i ? { ...s, ...p } : s)) }));
+function SignStep({ r, screen, update, errors, onNotPresent }: { r: Report; screen: string; update: Upd; errors: Record<string, string>; onNotPresent: () => void }) {
   const kind = typeLabel(r.type).toLowerCase();
-  return (
-    <div className="stack-lg">
-      <p className="lede-sm">Hand the phone to each person. By signing, they confirm they took part in, or received, this {kind} inspection on {fmtDate(r.details.date)}. A tenant can record that they do not agree and say why.</p>
-      <div className="checks">
-        <label className="check">
-          <input type="checkbox" checked={r.details.tenantPresent} onChange={(e) => update((cur) => ({ ...cur, details: { ...cur.details, tenantPresent: e.target.checked } }))} />
-          <span className="check-box" aria-hidden="true"><IconCheck size={14} /></span>
-          <span className="check-text"><span className="check-label">Tenant present</span><span className="check-hint">Untick to complete the report without a tenant signature.</span></span>
-        </label>
+  if (screen === "sign:ll") {
+    const s = r.landlordSig;
+    if (!s) return null;
+    return (
+      <div className="sign-screen">
+        <Field id="ln" label={`Name, for ${COMPANY.replace(" Inc.", "")}`} error={errors.ln}>
+          <input id="ln" type="text" value={s.name} onChange={(e) => update((cur) => ({ ...cur, landlordSig: { ...cur.landlordSig!, name: e.target.value } }))} />
+        </Field>
+        {!r.details.tenantPresent && <p className="fine">Tenant not present: the report records that. <button type="button" className="link" onClick={() => update((cur) => ({ ...cur, details: { ...cur.details, tenantPresent: true } }))}>Tenant is here</button></p>}
+        <div className={`sig-wrap${errors.ls ? " has-error" : ""}`}>
+          <SignaturePad label="Landlord or agent" value={s.dataUrl} onChange={(d) => update((cur) => ({ ...cur, landlordSig: { ...cur.landlordSig!, dataUrl: d, at: d ? new Date().toISOString() : "" } }))} />
+          {errors.ls && <p className="field-error">{errors.ls}</p>}
+        </div>
       </div>
-      {r.details.tenantPresent && r.tenantSigs.map((s, i) => (
-        <section key={i} className="sign-block">
-          <p className="group-label">Tenant{r.tenantSigs.length > 1 ? ` ${i + 1}` : ""}</p>
-          <Field id={`tn${i}`} label="Name" error={errors[`tn${i}`]}>
-            <input id={`tn${i}`} type="text" value={s.name} onChange={(e) => setT(i, { name: e.target.value })} />
-          </Field>
-          <fieldset className={`group${errors[`ta${i}`] ? " has-error" : ""}`}>
-            <legend className="sr-only">Tenant response</legend>
-            <div className="options">
-              {([["agree", "I agree this report fairly represents the condition of the unit"], ["disagree", "I do not agree with this report"], ["declined", "Tenant declined to sign"]] as const).map(([v, l]) => (
-                <label key={v} className="option option-tight">
-                  <input type="radio" name={`agree${i}`} checked={s.agree === v} onChange={() => setT(i, { agree: v, ...(v === "declined" ? { dataUrl: "", at: "" } : {}) })} />
-                  <span className="option-radio" aria-hidden="true" />
-                  <span className="option-text"><span className="option-when">{l}</span></span>
-                </label>
-              ))}
-            </div>
-            {errors[`ta${i}`] && <p className="field-error">{errors[`ta${i}`]}</p>}
-          </fieldset>
-          {s.agree === "disagree" && (
-            <Field id={`tr${i}`} label="Reasons">
-              <textarea id={`tr${i}`} className="ta-sm" value={s.reason} onChange={(e) => setT(i, { reason: e.target.value })} />
-            </Field>
-          )}
-          {s.agree !== "declined" && (
-            <div className={errors[`ts${i}`] ? "has-error" : ""}>
-              <SignaturePad label={`Tenant ${s.name}`} value={s.dataUrl} onChange={(d) => setT(i, { dataUrl: d, at: d ? new Date().toISOString() : "" })} />
-              {errors[`ts${i}`] && <p className="field-error">{errors[`ts${i}`]}</p>}
-            </div>
-          )}
-        </section>
-      ))}
-      {r.landlordSig && (
-        <section className="sign-block">
-          <p className="group-label">Landlord / agent, for {COMPANY}</p>
-          <Field id="ln" label="Name" error={errors.ln}>
-            <input id="ln" type="text" value={r.landlordSig.name} onChange={(e) => update((cur) => ({ ...cur, landlordSig: { ...cur.landlordSig!, name: e.target.value } }))} />
-          </Field>
-          <div className={errors.ls ? "has-error" : ""}>
-            <SignaturePad label="Landlord or agent" value={r.landlordSig.dataUrl} onChange={(d) => update((cur) => ({ ...cur, landlordSig: { ...cur.landlordSig!, dataUrl: d, at: d ? new Date().toISOString() : "" } }))} />
-            {errors.ls && <p className="field-error">{errors.ls}</p>}
-          </div>
-        </section>
+    );
+  }
+  const i = Number(screen.slice(6));
+  const s = r.tenantSigs[i];
+  if (!s) return null;
+  const setT = (p: Partial<TenantSignature>) => update((cur) => ({ ...cur, tenantSigs: cur.tenantSigs.map((x, j) => (j === i ? { ...x, ...p } : x)) }));
+  return (
+    <div className="sign-screen">
+      <Field id={`tn${i}`} label="Tenant name" error={errors[`tn${i}`]}>
+        <input id={`tn${i}`} type="text" value={s.name} onChange={(e) => setT({ name: e.target.value })} />
+      </Field>
+      <div className={`group${errors[`ta${i}`] ? " has-error" : ""}`}>
+        <p className="sign-q" id={`q${i}`}>Does this {kind} report ({fmtDate(r.details.date)}) fairly show the unit&apos;s condition?</p>
+        <div className="seg seg-3" role="radiogroup" aria-labelledby={`q${i}`}>
+          {([["agree", "I agree"], ["disagree", "I disagree"], ["declined", "Won't sign"]] as const).map(([v, l]) => (
+            <label key={v} className={`seg-opt seg-${v}`}>
+              <input type="radio" name={`agree${i}`} checked={s.agree === v} onChange={() => setT({ agree: v, ...(v === "declined" ? { dataUrl: "", at: "" } : {}) })} />
+              <span>{l}</span>
+            </label>
+          ))}
+        </div>
+        {errors[`ta${i}`] && <p className="field-error">{errors[`ta${i}`]}</p>}
+      </div>
+      {s.agree === "disagree" && (
+        <div className="field">
+          <label className="sr-only" htmlFor={`tr${i}`}>Reasons</label>
+          <textarea id={`tr${i}`} className="ta-xs" placeholder="Why the tenant disagrees" value={s.reason} onChange={(e) => setT({ reason: e.target.value })} />
+        </div>
       )}
+      {s.agree === "declined" ? (
+        <p className="note note-tight">Recorded as declined to sign. No signature needed.</p>
+      ) : (
+        <div className={`sig-wrap${errors[`ts${i}`] ? " has-error" : ""}`}>
+          <SignaturePad label={`Tenant ${s.name}`} value={s.dataUrl} onChange={(d) => setT({ dataUrl: d, at: d ? new Date().toISOString() : "" })} />
+          {errors[`ts${i}`] && <p className="field-error">{errors[`ts${i}`]}</p>}
+        </div>
+      )}
+      {i === 0 && <button type="button" className="link fine-link" onClick={onNotPresent}>Tenant not here? Skip tenant signatures</button>}
     </div>
   );
 }
@@ -1023,56 +1045,62 @@ function Done({ r, headingRef, onClose, onDelete, isSaved }: { r: Report; headin
   const worse = r.rooms.flatMap((room) => room.items.filter((i) => itemChange(i, room.kind) === "worse")).length;
 
   return (
-    <section className="confirm step" aria-labelledby="confirm-title">
-      <p className="eyebrow eyebrow-accent"><IconCheck size={14} /> {isSaved ? "Saved report" : "Inspection complete"}</p>
-      <h2 id="confirm-title" ref={headingRef} tabIndex={-1} className="confirm-title">{typeLabel(r.type)} report ready.</h2>
-      <div className="ref">
-        <p className="ref-label">Report ID</p>
-        <p className="ref-value tnum">{r.id}</p>
-      </div>
-      <dl className="review-list confirm-summary">
-        <div className="review-row"><dt>Property</dt><dd>{addressLine(r.details)}</dd></div>
-        <div className="review-row"><dt>Tenant(s)</dt><dd>{r.details.tenants}</dd></div>
-        <div className="review-row"><dt>Completed</dt><dd>{fmtDateTime(r.completedAt)}</dd></div>
-        {r.type === "out" && <div className="review-row"><dt>Changes</dt><dd>{r.baselineRef ? `${worse} item${worse === 1 ? "" : "s"} worse than at move-in` : "No move-in report loaded"}</dd></div>}
-      </dl>
+    <section className="screen confirm" aria-labelledby="confirm-title">
+      <header className="screen-head">
+        <div className="screen-head-text">
+          <p className="screen-eyebrow eyebrow-accent"><IconCheck size={14} /> {isSaved ? "Saved report" : "Inspection complete"}</p>
+          <h2 id="confirm-title" ref={headingRef} tabIndex={-1} className="screen-title">{typeLabel(r.type)} report ready</h2>
+        </div>
+      </header>
+      <div className="screen-body step">
+        <div className="ref ref-c">
+          <p className="ref-label">Report ID</p>
+          <p className="ref-value tnum">{r.id}</p>
+        </div>
+        <dl className="review-list confirm-summary">
+          <div className="review-row"><dt>Property</dt><dd>{addressLine(r.details)}</dd></div>
+          <div className="review-row"><dt>Tenant(s)</dt><dd>{r.details.tenants}</dd></div>
+          <div className="review-row"><dt>Completed</dt><dd>{fmtDateTime(r.completedAt)}</dd></div>
+          {r.type === "out" && <div className="review-row"><dt>Changes</dt><dd>{r.baselineRef ? `${worse} item${worse === 1 ? "" : "s"} worse than at move-in` : "No move-in report loaded"}</dd></div>}
+        </dl>
 
-      <div className="done-actions">
-        <button type="button" className="btn btn-primary btn-block" disabled={!!busy} onClick={() => run("pdf", async () => download(await getPdf(), (await names()).pdf))}>
-          {busy === "pdf" ? "Preparing PDF…" : "Download PDF"}
-        </button>
-        {canShare && (
-          <button type="button" className="btn btn-quiet btn-block" disabled={!!busy} onClick={() => run("share", async () => {
-            const f = new File([await getPdf()], (await names()).pdf, { type: "application/pdf" });
-            await navigator.share({ files: [f], title: `${typeLabel(r.type)} inspection ${r.id}` });
-          })}>{busy === "share" ? "Preparing…" : "Share PDF (email, text, Drive)"}</button>
+        <div className="done-actions">
+          <button type="button" className="btn btn-primary btn-block" disabled={!!busy} onClick={() => run("pdf", async () => download(await getPdf(), (await names()).pdf))}>
+            {busy === "pdf" ? "Preparing PDF…" : "Download PDF"}
+          </button>
+          <div className="done-pair">
+            {canShare && (
+              <button type="button" className="btn btn-quiet" disabled={!!busy} onClick={() => run("share", async () => {
+                const f = new File([await getPdf()], (await names()).pdf, { type: "application/pdf" });
+                await navigator.share({ files: [f], title: `${typeLabel(r.type)} inspection ${r.id}` });
+              })}>{busy === "share" ? "Preparing…" : "Share PDF"}</button>
+            )}
+            <button type="button" className="btn btn-quiet" disabled={!!busy} onClick={() => run("print", async () => {
+              const url = URL.createObjectURL(await getPdf());
+              const w = window.open(url, "_blank");
+              if (!w) location.href = url;
+            })}>{busy === "print" ? "Preparing…" : "Open to print"}</button>
+          </div>
+          {r.type === "in" && (
+            <button type="button" className="btn btn-quiet btn-block" disabled={!!busy} onClick={() => run("json", async () => {
+              const blob = new Blob([JSON.stringify(await buildReportFile(r))], { type: "application/json" });
+              const name = (await names()).json;
+              const f = new File([blob], name, { type: "application/json" });
+              if (navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f], title: name }); return; } catch (e) { if ((e as Error).name === "AbortError") return; } }
+              download(blob, name);
+            })}>{busy === "json" ? "Preparing…" : "Save move-in file (for the move-out)"}</button>
+          )}
+          {msg && <p className="field-error" role="alert">{msg}</p>}
+        </div>
+        {sent === false && (
+          <p className="fine done-note">Not sent to the office: nothing has left this phone. Download or share the PDF and give the tenant a copy.{r.type === "in" ? " A copy stays under Saved reports." : ""}</p>
         )}
-        <button type="button" className="btn btn-quiet btn-block" disabled={!!busy} onClick={() => run("print", async () => {
-          const url = URL.createObjectURL(await getPdf());
-          const w = window.open(url, "_blank");
-          if (!w) location.href = url;
-        })}>{busy === "print" ? "Preparing…" : "Open PDF to print"}</button>
-        {r.type === "in" && (
-          <button type="button" className="btn btn-quiet btn-block" disabled={!!busy} onClick={() => run("json", async () => {
-            const blob = new Blob([JSON.stringify(await buildReportFile(r))], { type: "application/json" });
-            const name = (await names()).json;
-            const f = new File([blob], name, { type: "application/json" });
-            if (navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f], title: name }); return; } catch (e) { if ((e as Error).name === "AbortError") return; } }
-            download(blob, name);
-          })}>{busy === "json" ? "Preparing…" : "Save move-in file for the move-out"}</button>
-        )}
-        {msg && <p className="field-error" role="alert">{msg}</p>}
       </div>
-
-      {r.type === "in" && (
-        <p className="note">A copy is kept under Saved on this device. For a move-out on another phone, open the move-in file saved above.</p>
-      )}
-      {sent === false && (
-        <p className="preview-note">Not sent to the office. Nothing has left this device: download or share the PDF to keep a copy and give one to the tenant.</p>
-      )}
-      <div className="confirm-actions">
-        {onDelete && <button type="button" className="btn btn-ghost" onClick={onDelete}>Delete from this device</button>}
-        <button type="button" className="btn btn-primary" onClick={onClose}>{isSaved ? "Back to saved reports" : "Finish"}</button>
+      <div className="bar">
+        <div className="bar-inner">
+          {onDelete && <button type="button" className="btn btn-ghost bar-back" onClick={onDelete}>Delete</button>}
+          <button type="button" className="btn btn-primary bar-next" onClick={onClose}>{isSaved ? "Back to saved reports" : "Finish"}</button>
+        </div>
       </div>
     </section>
   );
